@@ -686,6 +686,26 @@ __device__ void bip32_ckd_priv(u8 key[32], u8 cc[32], u32 index) {
     for (int i = 0; i < 32; i++) cc[i] = I[32 + i];
 }
 
+// seed[64] -> raw 32-byte private key at m/44'/0'/0'/0/0.
+// Stops before pubkey derivation. Used by k_pipeline_pubkey to skip
+// the SHA256+RIPEMD160 step and compare the pubkey directly instead.
+// __noinline__ required — see the note on pbkdf2_hmac_sha512_64.
+__device__ __noinline__ void seed_to_privkey(const u8 seed[64], u8 privkey[32]) {
+    u8 I[64];
+    hmac_sha512((const u8*)"Bitcoin seed", 12, seed, 64, I);
+    u8 key[32], cc[32];
+    for (int i = 0; i < 32; i++) { key[i] = I[i]; cc[i] = I[32 + i]; }
+
+    const u32 H = 0x80000000u;
+    bip32_ckd_priv(key, cc, H + 44);
+    bip32_ckd_priv(key, cc, H +  0);
+    bip32_ckd_priv(key, cc, H +  0);
+    bip32_ckd_priv(key, cc,      0);
+    bip32_ckd_priv(key, cc,      0);
+
+    for (int i = 0; i < 32; i++) privkey[i] = key[i];
+}
+
 // seed[64] -> P2PKH hash160[20] for m/44'/0'/0'/0/0.
 // __noinline__ required — see the note on pbkdf2_hmac_sha512_64.
 __device__ __noinline__ void seed_to_hash160(const u8 seed[64], u8 hash160[20]) {
@@ -781,6 +801,64 @@ void k_pipeline(const unsigned short* cand, const u32* survivors, u32 count,
 
     int eq = 1;
     for (int j = 0; j < 20; j++) if (h160[j] != target_h160[j]) { eq = 0; break; }
+    if (eq) {
+        if (atomicCAS(found_flag, 0u, 1u) == 0u) *found_idx = i;
+    }
+}
+
+// ===========================================================================
+// Pubkey pipeline: same flow as k_pipeline but stops at the compressed public
+// key and compares 33 bytes against target_pubkey instead of computing
+// SHA256(pubkey) + RIPEMD160. Saves ~2 hash rounds per surviving candidate.
+//
+// Pass 1 (k_filter) is shared — BIP-39 checksum is always checked first.
+// ===========================================================================
+extern "C" __global__
+void k_pipeline_pubkey(
+        const unsigned short* cand,    // flat [N×12] word-index array
+        const u32*            survivors, // compacted survivor indices from k_filter
+        u32                   count,     // number of survivors
+        const u8*             wordlist,
+        const u8*             word_lens,
+        u32                   word_stride,
+        const u8*             target_pubkey, // 33 bytes: compressed pubkey to match
+        unsigned int*         found_flag,
+        unsigned int*         found_idx)
+{
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= count) return;
+    if (*found_flag) return;
+
+    u32 i = survivors[t];
+    const unsigned short* idx = cand + (u64)i * 12;
+
+    // Build the NFKD mnemonic string (same as k_pipeline).
+    u8 msg[MNEMONIC_BUF];
+    u32 mlen = 0;
+    for (int w = 0; w < 12; w++) {
+        u32 wi = idx[w];
+        u8 wl  = word_lens[wi];
+        const u8* wp = wordlist + (u64)wi * word_stride;
+        for (u32 c = 0; c < wl; c++) msg[mlen++] = wp[c];
+        if (w < 11) msg[mlen++] = ' ';
+    }
+
+    // BIP-39 seed via PBKDF2-HMAC-SHA512 (2048 iterations, no passphrase).
+    u8 seed[64];
+    const u8 salt[8] = {'m','n','e','m','o','n','i','c'};
+    pbkdf2_hmac_sha512_64(msg, mlen, salt, 8, 2048, seed);
+
+    // BIP32 m/44'/0'/0'/0/0 -> private key (stops before hash160).
+    u8 privkey[32];
+    seed_to_privkey(seed, privkey);
+
+    // Derive the compressed 33-byte public key.
+    u64 k[4]; be32_to_limbs(privkey, k);
+    u8 pub[33]; pubkey_compressed(k, pub);
+
+    // Compare 33-byte compressed pubkey against target.
+    int eq = 1;
+    for (int j = 0; j < 33; j++) if (pub[j] != target_pubkey[j]) { eq = 0; break; }
     if (eq) {
         if (atomicCAS(found_flag, 0u, 1u) == 0u) *found_idx = i;
     }
