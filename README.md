@@ -74,6 +74,8 @@ The binary will be at `target/release/word-breaker`.
 
 ```
 ./target/release/words-breaker 1JKQKyPXm42BPQfu2pevNzT1ej5KBcdaHS --tokenlist tokenlist.txt --min-token 3 --keep-word-order --keep-token-order --max-batch 16
+pubkey-mode
+./target/release/words-breaker --target-pubkey 0389d9cd176c59c5384044798cc23b650c57255dcd788151f25dfb2d55bb912399 --tokenlist tokenlist.txt --min-token 3 --keep-token-order
 ```
 
 
