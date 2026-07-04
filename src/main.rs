@@ -188,9 +188,18 @@ fn main() -> Result<()> {
         }
     };
 
+    
     let elapsed = start.elapsed();
     if !found {
-        println!("Exhausted all candidates without a match (elapsed: {elapsed:?})");
+        let mode_label = match &target_mode {
+            TargetMode::Hash160(_) => "address/hash160",
+            TargetMode::Pubkey(_)  => "pubkey33 (no hash)",
+        };
+        println!(
+            "Exhausted all candidates without a match.\n  Mode   : {}\n  Elapsed: {:.3}s",
+            mode_label,
+            elapsed.as_secs_f64(),
+        );
     }
     Ok(())
 }
@@ -488,7 +497,56 @@ impl Iterator for LazyPhraseIter {
         }
     }
 }
-
+// ---------------------------------------------------------------------------
+// ProgressIter — wraps LazyPhraseIter, prints throughput every INTERVAL items
+// ---------------------------------------------------------------------------
+ 
+struct ProgressIter {
+    inner:     LazyPhraseIter,
+    count:     usize,
+    interval:  usize,
+    start:     Instant,
+    last_tick: Instant,
+}
+ 
+impl ProgressIter {
+    fn new(inner: LazyPhraseIter, interval: usize) -> Self {
+        let now = Instant::now();
+        ProgressIter { inner, count: 0, interval, start: now, last_tick: now }
+    }
+}
+ 
+ 
+impl Iterator for ProgressIter {
+    type Item = [u16; 12];
+ 
+    fn next(&mut self) -> Option<[u16; 12]> {
+        let item = self.inner.next()?;
+        self.count += 1;
+ 
+        if self.count % self.interval == 0 {
+            let total_secs = self.start.elapsed().as_secs_f64();
+            let tick_secs  = self.last_tick.elapsed().as_secs_f64();
+            let tp_overall = self.count as f64 / total_secs.max(0.001);
+            let tp_recent  = self.interval as f64 / tick_secs.max(0.001);
+ 
+            // \r kembali ke awal baris, overwrite tanpa tambah baris baru.
+            // Spasi di akhir untuk menimpa sisa teks dari print sebelumnya.
+            print!(
+                "\r  {:>10} candidates | {:>7.1}s | {:>8}/s avg | {:>8}/s recent   ",
+                format_number(self.count),
+                total_secs,
+                format_number(tp_overall as usize),
+                format_number(tp_recent  as usize),
+            );
+            let _ = io::stdout().flush();
+            self.last_tick = Instant::now();
+        }
+ 
+        Some(item)
+    }
+}
+ 
 // ---------------------------------------------------------------------------
 // GPU search — lazy streaming, auto batch size, no OOM
 // ---------------------------------------------------------------------------
@@ -502,7 +560,7 @@ fn run_search_gpu(
     let gpu_handle = gpu::Gpu::new()?;
     let wordlist: &'static [&'static str] = language.words_by_prefix("");
     let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
-    // Batch size: CLI override, atau adaptive probe. Probe pakai dummy target.
+ 
     let probe_h160 = [0u8; 20];
     let batch_size = if let Some(b) = args.batch_size {
         println!("Using GPU (CUDA) — batch_size: {} (manual override)", format_number(b));
@@ -510,71 +568,162 @@ fn run_search_gpu(
     } else {
         probe_batch_size(&gpu_handle, &gpu_wordlist, &probe_h160, args.min_batch, args.max_batch)
     };
-
+ 
+    let mode_label: &'static str = match target_mode {
+        TargetMode::Hash160(_) => "address/hash160 (SHA256+RIPEMD160 per candidate)",
+        TargetMode::Pubkey(_)  => "pubkey33        (skip SHA256+RIPEMD160, ~30% faster)",
+    };
+    println!("Search mode : {}", mode_label);
+ 
     let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_token = slots.len();
     println!("Trying slot subsets {min_token}..={max_token}.");
-
-    let mut global_checked: usize = 0;
-
+ 
+    // Print progress every ~100K candidates
+    let progress_interval = 100_000;
+ 
+    let search_wall = Instant::now();
+    let mut all_stats: Vec<CombinationStats> = Vec::new();
+ 
     for slot_count in min_token..=max_token {
         let slot_indices: Vec<usize> = (0..slots.len()).collect();
-
+ 
         for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
             let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
-
-            println!("Slot combination {:?}: streaming to GPU...", chosen_indices);
+ 
+            println!(
+                "\n── Combination {:?} ──────────────────────────",
+                chosen_indices
+            );
             let _ = io::stdout().flush();
-
-            let iter = LazyPhraseIter::new(
+ 
+            // ProgressIter counts + prints throughput every 100K
+            let base_iter = LazyPhraseIter::new(
                 &chosen,
                 args.keep_token_order,
                 args.keep_word_order,
                 wordlist,
             );
-
-            let result = match target_mode {
-                TargetMode::Hash160(h160) =>
-                    gpu_handle.search(iter, &gpu_wordlist, h160, batch_size)?,
-                TargetMode::Pubkey(pubkey) =>
-                    gpu_handle.search_pubkey(iter, &gpu_wordlist, pubkey, batch_size)?,
+            let prog_iter = ProgressIter::new(base_iter, progress_interval);
+ 
+            let t_comb = Instant::now();
+ 
+            let (result, candidates_sent) = {
+                // We need to move prog_iter into search, but also read count after.
+                // Workaround: use a shared AtomicUsize updated by ProgressIter.
+                // Simpler: re-count via a second iter after — but that wastes time.
+                // Best: ProgressIter stores count internally; we read it after via
+                // a RefCell or just accept that gpu.search() consumes the iterator.
+                //
+                // Since gpu.search() takes ownership of the iterator, we wrap in
+                // a counting adapter that stores the final count in an Arc<AtomicUsize>.
+                let sent = Arc::new(AtomicUsize::new(0));
+                let sent_clone = Arc::clone(&sent);
+ 
+                struct CountingIter<I> {
+                    inner: I,
+                    counter: Arc<AtomicUsize>,
+                }
+                impl<I: Iterator<Item = [u16; 12]>> Iterator for CountingIter<I> {
+                    type Item = [u16; 12];
+                    fn next(&mut self) -> Option<[u16; 12]> {
+                        let item = self.inner.next()?;
+                        self.counter.fetch_add(1, Ordering::Relaxed);
+                        Some(item)
+                    }
+                }
+ 
+                let counting_iter = CountingIter {
+                    inner: prog_iter,
+                    counter: sent_clone,
+                };
+ 
+                let res = match target_mode {
+                    TargetMode::Hash160(h160) =>
+                        gpu_handle.search(counting_iter, &gpu_wordlist, h160, batch_size)?,
+                    TargetMode::Pubkey(pubkey) =>
+                        gpu_handle.search_pubkey(counting_iter, &gpu_wordlist, pubkey, batch_size)?,
+                };
+ 
+                (res, sent.load(Ordering::Relaxed))
             };
-
+            println!(); // ← TAMBAH INI: turun ke baris baru setelah progress \r
+            let comb_elapsed = t_comb.elapsed();
+            let tp = candidates_sent as f64 / comb_elapsed.as_secs_f64().max(0.001);
+ 
+            let stat = CombinationStats {
+                mode_label,
+                combination: chosen_indices.clone(),
+                candidates_sent,
+                elapsed: comb_elapsed,
+            };
+            stat.print();
+            all_stats.push(stat);
+ 
             match result {
                 Some(hit) => {
                     let phrase: Vec<&str> =
                         hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
-                    println!("Found matching mnemonic: {}", phrase.join(" "));
-                    println!(
-                        "Candidate index (0-based): {} (global: {})",
-                        hit.global_index,
-                        global_checked + hit.global_index,
-                    );
+ 
+                    println!("\n✓ Found matching mnemonic : {}", phrase.join(" "));
+                    println!("  Candidate index         : {}", hit.global_index);
+                    println!("  Combination             : {:?}", chosen_indices);
+                    println!("  Candidates checked      : {}", format_number(candidates_sent));
+                    println!("  Time for combination    : {:.3}s", comb_elapsed.as_secs_f64());
+                    println!("  Throughput              : {}/s", format_number(tp as usize));
+                    println!("  Total wall time         : {:.3}s", search_wall.elapsed().as_secs_f64());
                     match target_mode {
-                        TargetMode::Hash160(_) => println!("Match type: address/hash160"),
+                        TargetMode::Hash160(_) =>
+                            println!("  Match type              : address/hash160"),
                         TargetMode::Pubkey(pk) =>
-                            println!("Match type: pubkey {}", bytes_to_hex(pk)),
+                            println!("  Match type              : pubkey {}", bytes_to_hex(pk)),
                     }
+ 
+                    // Print comparison table across all combinations tried
+                    if all_stats.len() > 1 {
+                        println!("\n  ── Timing comparison ────────────────────");
+                        for s in &all_stats {
+                            s.print();
+                        }
+                        println!("  ─────────────────────────────────────────");
+                    }
+ 
                     let _ = io::stdout().flush();
                     std::mem::forget(gpu_handle);
                     std::process::exit(0);
                 }
                 None => {
                     println!(
-                        "Combination {:?}: no match. Global checked: ~{}",
-                        chosen_indices,
-                        format_number(global_checked),
+                        "  No match. Wall time so far: {:.3}s",
+                        search_wall.elapsed().as_secs_f64(),
                     );
-                    global_checked += 1;
                 }
             }
         }
     }
-
+ 
+    // Exhausted — print final summary table
+    let total_wall = search_wall.elapsed();
+    let total_cands: usize = all_stats.iter().map(|s| s.candidates_sent).sum();
+    let total_tp = total_cands as f64 / total_wall.as_secs_f64().max(0.001);
+ 
+    println!("\n── Final summary ────────────────────────────");
+    for s in &all_stats {
+        s.print();
+    }
+    println!(
+        "  TOTAL  {:>10} candidates | {:.3}s | {}/s",
+        format_number(total_cands),
+        total_wall.as_secs_f64(),
+        format_number(total_tp as usize),
+    );
+    println!("─────────────────────────────────────────────");
+ 
     std::mem::forget(gpu_handle);
     Ok(false)
 }
-
+ 
+ 
 /// Adaptive batch size probe.
 ///
 /// Mulai dari START (64K), jalankan batch dummy.
@@ -688,11 +837,12 @@ fn run_search_cpu(
     let max_token = slots.len();
     println!("Trying slot subsets {min_token}..={max_token}.");
 
-    let counter = Arc::new(AtomicUsize::new(0));
-    let found = Arc::new(AtomicBool::new(false));
+    let counter      = Arc::new(AtomicUsize::new(0));
+    let found        = Arc::new(AtomicBool::new(false));
     let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
-    let found_index = Arc::new(AtomicUsize::new(0));
-
+    let found_index  = Arc::new(AtomicUsize::new(0));
+    let cpu_start    = Arc::new(Instant::now());         // ← TAMBAH INI
+ 
     'outer: for slot_count in min_token..=max_token {
         if found.load(Ordering::Relaxed) {
             break;
@@ -730,12 +880,20 @@ fn run_search_cpu(
                 if found.load(Ordering::Relaxed) {
                     return;
                 }
-
                 let i = counter.fetch_add(1, Ordering::Relaxed);
                 if i % 100_000 == 0 && i > 0 {
-                    println!("Checked {} candidates...", format_number(i));
+                    let secs = cpu_start.elapsed().as_secs_f64();
+                    let tp   = if secs > 0.0 { i as f64 / secs } else { 0.0 };
+                    print!(
+                        "
+  {:>10} candidates | {:>7.1}s | {:>8}/s avg   ",
+                        format_number(i),
+                        secs,
+                        format_number(tp as usize),
+                    );
                     let _ = io::stdout().flush();
                 }
+ 
 
                 let phrase: Vec<&str> =
                     phrase_indices.iter().map(|&idx| wordlist[idx as usize]).collect();
@@ -794,14 +952,23 @@ fn run_search_cpu(
         }
     }
 
-    if found.load(Ordering::SeqCst) {
-        let fp = found_phrase.lock().unwrap();
-        let idx = found_index.load(Ordering::SeqCst);
-        println!("Found matching mnemonic: {fp}");
-        println!("Candidate index (0-based): {idx}");
+    println!();
+
+        if found.load(Ordering::SeqCst) {
+        let fp    = found_phrase.lock().unwrap();
+        let idx   = found_index.load(Ordering::SeqCst);
+        let secs  = cpu_start.elapsed().as_secs_f64();
+        let tp    = if secs > 0.0 { idx as f64 / secs } else { 0.0 };
+        let mode_label = match target_mode.as_ref() {
+            TargetMode::Hash160(_) => "address/hash160 (CPU)",
+            TargetMode::Pubkey(_)  => "pubkey33 — no hash (CPU, faster)",
+        };
+        println!("\n✓ Found matching mnemonic: {fp}");
+        println!("  Candidate index (0-based): {idx}");
+        println!("  Time to find  : {:.3}s", secs);
+        println!("  Throughput    : {}/s", format_number(tp as usize));
         match target_mode.as_ref() {
             TargetMode::Hash160(_) => {
-                // Reconstruct address for display.
                 let m = Mnemonic::parse_in_normalized(language, &*fp).unwrap();
                 let seed = m.to_seed("");
                 let secp2 = Secp256k1::new();
@@ -810,12 +977,17 @@ fn run_search_cpu(
                     if let Ok(child) = xprv.derive_priv(&secp2, &deriv) {
                         let pub2 = PublicKey::new(child.private_key.public_key(&secp2));
                         let addr = Address::p2pkh(&pub2, Network::Bitcoin);
-                        println!("Derived address: {addr}");
+                        println!("  Derived address: {addr}");
                     }
                 }
             }
-            TargetMode::Pubkey(pk) => println!("Matched pubkey: {}", bytes_to_hex(pk)),
+            TargetMode::Pubkey(pk) => println!("  Matched pubkey: {}", bytes_to_hex(pk)),
         }
+        println!("─────────────────────────────────────────");
+        println!("  Mode       : {}", mode_label);
+        println!("  Elapsed    : {:.3}s", secs);
+        println!("  Throughput : {}/s", format_number(tp as usize));
+        println!("─────────────────────────────────────────");
         Ok(true)
     } else {
         Ok(false)
@@ -1039,7 +1211,31 @@ fn parse_language(lang: &str) -> Result<Language> {
 // ---------------------------------------------------------------------------
 // Target mode: address (hash160) or raw pubkey
 // ---------------------------------------------------------------------------
-
+#[derive(Default)]
+struct CombinationStats {
+    mode_label:       &'static str,
+    combination:      Vec<usize>,
+    candidates_sent:  usize,
+    elapsed:          std::time::Duration,
+}
+ 
+impl CombinationStats {
+    fn throughput(&self) -> f64 {
+        let s = self.elapsed.as_secs_f64();
+        if s > 0.0 { self.candidates_sent as f64 / s } else { 0.0 }
+    }
+ 
+    fn print(&self) {
+        println!(
+            "  [{:?}] {:>10} candidates | {:.3}s | {}/s | mode: {}",
+            self.combination,
+            format_number(self.candidates_sent),
+            self.elapsed.as_secs_f64(),
+            format_number(self.throughput() as usize),
+            self.mode_label,
+        );
+    }
+}
 /// What the search compares against.
 #[derive(Clone, Debug)]
 pub enum TargetMode {
