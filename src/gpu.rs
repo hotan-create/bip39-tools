@@ -337,7 +337,106 @@ impl Gpu {
             let _ = std::io::stdout().flush();
         }
     }
-}
+
+    /// Like `search()` but compares the derived **compressed public key** (33 bytes)
+    /// instead of hash160. Skips the SHA256+RIPEMD160 step on the GPU kernel,
+    /// making each candidate slightly faster to evaluate.
+    ///
+    /// Uses `k_filter` (same BIP-39 checksum filter) + `k_pipeline_pubkey` (new kernel).
+    pub fn search_pubkey(
+        &self,
+        candidates: impl Iterator<Item = [u16; 12]>,
+        wordlist: &GpuWordlist,
+        target_pubkey: &[u8; 33],
+        batch_size: usize,
+    ) -> Result<Option<SearchHit>> {
+        let d_wordlist = DeviceBuffer::from_slice(&wordlist.packed)?;
+        let d_lens     = DeviceBuffer::from_slice(&wordlist.lens)?;
+        let d_target   = DeviceBuffer::from_slice(target_pubkey.as_ref())?;
+        let filter     = self.module.get_function("k_filter")?;
+        let pipeline   = self.module.get_function("k_pipeline_pubkey")?;
+
+        let d_survivors = unsafe { DeviceBuffer::<u32>::uninitialized(batch_size)? };
+
+        let mut buf: Vec<u16> = Vec::with_capacity(batch_size * 12);
+        let mut batch_start: usize = 0;
+        let mut checked: usize = 0;
+        let block = 256u32;
+        let stream = &self.stream;
+        let mut it = candidates;
+
+        loop {
+            buf.clear();
+            for _ in 0..batch_size {
+                match it.next() {
+                    Some(c) => buf.extend_from_slice(&c),
+                    None    => break,
+                }
+            }
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let n = buf.len() / 12;
+
+            let d_cand       = DeviceBuffer::from_slice(&buf)?;
+            let d_counter    = DeviceBuffer::from_slice(&[0u32])?;
+            let d_found_flag = DeviceBuffer::from_slice(&[0u32])?;
+            let d_found_idx  = DeviceBuffer::from_slice(&[0u32])?;
+
+            // Pass 1: BIP-39 checksum filter (same as hash160 path).
+            let grid = ((n as u32) + block - 1) / block;
+            unsafe {
+                launch!(filter<<<grid, block, 0, stream>>>(
+                    d_cand.as_device_ptr(), n as u32,
+                    d_survivors.as_device_ptr(), d_counter.as_device_ptr()
+                ))?;
+            }
+            stream.synchronize()?;
+            let mut counter = [0u32];
+            d_counter.copy_to(&mut counter)?;
+            let count = counter[0];
+
+            // Pass 2: derive pubkey, compare — no hash160.
+            if count > 0 {
+                let grid2 = (count + block - 1) / block;
+                unsafe {
+                    launch!(pipeline<<<grid2, block, 0, stream>>>(
+                        d_cand.as_device_ptr(),
+                        d_survivors.as_device_ptr(),
+                        count,
+                        d_wordlist.as_device_ptr(),
+                        d_lens.as_device_ptr(),
+                        wordlist.stride as u32,
+                        d_target.as_device_ptr(),
+                        d_found_flag.as_device_ptr(),
+                        d_found_idx.as_device_ptr()
+                    ))?;
+                }
+                stream.synchronize()?;
+            }
+
+            let mut found_flag = [0u32];
+            d_found_flag.copy_to(&mut found_flag)?;
+            if found_flag[0] != 0 {
+                let mut found_idx = [0u32];
+                d_found_idx.copy_to(&mut found_idx)?;
+                let local = found_idx[0] as usize;
+                let mut indices = [0u16; 12];
+                indices.copy_from_slice(&buf[local * 12..local * 12 + 12]);
+                return Ok(Some(SearchHit {
+                    global_index: batch_start + local,
+                    indices,
+                }));
+            }
+
+            checked += n;
+            batch_start += n;
+            println!("Checked {} candidates...", crate::format_number(checked));
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    }
+} // end impl Gpu
 
 /// Runs all primitive selftests, printing PASS/FAIL per primitive. Returns
 /// `Ok(true)` iff every check passed.
