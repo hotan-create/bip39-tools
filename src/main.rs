@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bip39::{Language, Mnemonic};
 use bitcoin::address::{Address, NetworkChecked, NetworkUnchecked};
 use bitcoin::bip32::{DerivationPath, Xpriv};
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::{PublicKey as Secp256k1PubKey, Secp256k1};
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
@@ -28,7 +28,16 @@ mod gpu;
 )]
 struct Args {
     /// Target legacy Bitcoin address (Base58, starts with '1').
+    /// Exactly one of --target-address (positional) or --target-pubkey must be given.
     target_address: Option<String>,
+
+    /// Target compressed or uncompressed public key (hex).
+    /// Compressed: 66 hex chars (33 bytes, prefix 02 or 03).
+    /// Uncompressed: 130 hex chars (65 bytes, prefix 04) — auto-converted to compressed.
+    /// Using a pubkey target skips the final SHA256+RIPEMD160 hash step on the GPU,
+    /// making each check slightly faster.
+    #[arg(long, value_name = "HEX")]
+    target_pubkey: Option<String>,
 
     /// BIP-39 wordlist language
     #[arg(long, short, default_value = "english")]
@@ -127,16 +136,33 @@ fn main() -> Result<()> {
         }
     }
 
-    let target_address = args
-        .target_address
-        .as_deref()
-        .context("Missing target address")?;
-
-    let target: Address<NetworkChecked> = target_address
-        .parse::<Address<NetworkUnchecked>>()
-        .context("Invalid Bitcoin address")?
-        .require_network(Network::Bitcoin.into())
-        .context("Only mainnet legacy addresses are supported")?;
+    // ── Resolve target: exactly one of --target-address or --target-pubkey ──
+    let target_mode: TargetMode = match (&args.target_address, &args.target_pubkey) {
+        (Some(addr_str), None) => {
+            let target: Address<NetworkChecked> = addr_str
+                .parse::<Address<NetworkUnchecked>>()
+                .context("Invalid Bitcoin address")?
+                .require_network(Network::Bitcoin.into())
+                .context("Only mainnet legacy addresses are supported")?;
+            let h160 = p2pkh_hash160(&target)?;
+            println!("Target: address {} (hash160 mode)", addr_str);
+            TargetMode::Hash160(h160)
+        }
+        (None, Some(pk_hex)) => {
+            let pubkey = parse_pubkey_hex(pk_hex)?;
+            println!(
+                "Target: pubkey {} (pubkey mode — skips SHA256+RIPEMD160, faster)",
+                &pk_hex[..pk_hex.trim().len().min(20)]
+            );
+            TargetMode::Pubkey(pubkey)
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Specify either a positional address OR --target-pubkey, not both."
+        ),
+        (None, None) => anyhow::bail!(
+            "Missing target: provide a legacy Bitcoin address (positional) or --target-pubkey <HEX>."
+        ),
+    };
 
     let language = parse_language(&args.language)?;
     let start = Instant::now();
@@ -151,13 +177,13 @@ fn main() -> Result<()> {
 
     let found = if args.cpu {
         println!("--cpu flag set: using CPU.");
-        run_search_cpu(&args, &slots, &target, language)?
+        run_search_cpu(&args, &slots, &target_mode, language)?
     } else {
-        match run_search_gpu(&args, &slots, &target, language) {
+        match run_search_gpu(&args, &slots, &target_mode, language) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("GPU unavailable ({e:#}); falling back to CPU.");
-                run_search_cpu(&args, &slots, &target, language)?
+                run_search_cpu(&args, &slots, &target_mode, language)?
             }
         }
     };
@@ -470,20 +496,19 @@ impl Iterator for LazyPhraseIter {
 fn run_search_gpu(
     args: &Args,
     slots: &[Slot],
-    target: &Address<NetworkChecked>,
+    target_mode: &TargetMode,
     language: Language,
 ) -> Result<bool> {
     let gpu_handle = gpu::Gpu::new()?;
     let wordlist: &'static [&'static str] = language.words_by_prefix("");
     let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
-    let target_h160 = p2pkh_hash160(target)?;
-
-    // Batch size: CLI override, atau adaptive probe mulai dari 1<<16.
+    // Batch size: CLI override, atau adaptive probe. Probe pakai dummy target.
+    let probe_h160 = [0u8; 20];
     let batch_size = if let Some(b) = args.batch_size {
         println!("Using GPU (CUDA) — batch_size: {} (manual override)", format_number(b));
         b
     } else {
-        probe_batch_size(&gpu_handle, &gpu_wordlist, &target_h160, args.min_batch, args.max_batch)
+        probe_batch_size(&gpu_handle, &gpu_wordlist, &probe_h160, args.min_batch, args.max_batch)
     };
 
     let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
@@ -508,7 +533,14 @@ fn run_search_gpu(
                 wordlist,
             );
 
-            match gpu_handle.search(iter, &gpu_wordlist, &target_h160, batch_size)? {
+            let result = match target_mode {
+                TargetMode::Hash160(h160) =>
+                    gpu_handle.search(iter, &gpu_wordlist, h160, batch_size)?,
+                TargetMode::Pubkey(pubkey) =>
+                    gpu_handle.search_pubkey(iter, &gpu_wordlist, pubkey, batch_size)?,
+            };
+
+            match result {
                 Some(hit) => {
                     let phrase: Vec<&str> =
                         hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
@@ -518,7 +550,11 @@ fn run_search_gpu(
                         hit.global_index,
                         global_checked + hit.global_index,
                     );
-                    println!("Derived address: {target}");
+                    match target_mode {
+                        TargetMode::Hash160(_) => println!("Match type: address/hash160"),
+                        TargetMode::Pubkey(pk) =>
+                            println!("Match type: pubkey {}", bytes_to_hex(pk)),
+                    }
                     let _ = io::stdout().flush();
                     std::mem::forget(gpu_handle);
                     std::process::exit(0);
@@ -629,7 +665,7 @@ const BYTES_PER_CAND_TOTAL: usize = 28;
 fn run_search_cpu(
     args: &Args,
     slots: &[Slot],
-    target: &Address<NetworkChecked>,
+    target_mode: &TargetMode,
     language: Language,
 ) -> Result<bool> {
     let num_threads = if args.threads == 0 {
@@ -643,9 +679,10 @@ fn run_search_cpu(
     println!("Using CPU with {num_threads} threads.");
 
     let wordlist: &'static [&'static str] = language.words_by_prefix("");
-    let target_str = target.to_string();
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
     let secp = Arc::new(Secp256k1::new());
+    // Clone target_mode data into Arc for thread sharing.
+    let target_mode = Arc::new(target_mode.clone());
 
     let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_token = slots.len();
@@ -722,10 +759,29 @@ fn run_search_cpu(
                     };
                 let child_pub =
                     PublicKey::new(child_xprv.private_key.public_key(&secp));
-                let addr: Address<NetworkChecked> =
-                    Address::p2pkh(&child_pub, Network::Bitcoin);
 
-                if addr.to_string() == target_str {
+                // Compare based on target mode.
+                let matched = match target_mode.as_ref() {
+                    TargetMode::Hash160(h160) => {
+                        // Compute hash160 and compare.
+                        let addr: Address<NetworkChecked> =
+                            Address::p2pkh(&child_pub, Network::Bitcoin);
+                        let spk = addr.script_pubkey();
+                        let b = spk.as_bytes();
+                        if b.len() == 25 {
+                            b[3..23] == h160[..]
+                        } else {
+                            false
+                        }
+                    }
+                    TargetMode::Pubkey(target_pk) => {
+                        // Compare compressed pubkey directly — faster (no hash needed).
+                        let pk_bytes = child_pub.inner.serialize();
+                        &pk_bytes == target_pk
+                    }
+                };
+
+                if matched {
                     found.store(true, Ordering::SeqCst);
                     found_index.store(i, Ordering::SeqCst);
                     *found_phrase.lock().unwrap() = phrase_str;
@@ -743,7 +799,23 @@ fn run_search_cpu(
         let idx = found_index.load(Ordering::SeqCst);
         println!("Found matching mnemonic: {fp}");
         println!("Candidate index (0-based): {idx}");
-        println!("Derived address: {target_str}");
+        match target_mode.as_ref() {
+            TargetMode::Hash160(_) => {
+                // Reconstruct address for display.
+                let m = Mnemonic::parse_in_normalized(language, &*fp).unwrap();
+                let seed = m.to_seed("");
+                let secp2 = Secp256k1::new();
+                let deriv: DerivationPath = "m/44'/0'/0'/0/0".parse().unwrap();
+                if let Ok(xprv) = Xpriv::new_master(Network::Bitcoin, &seed) {
+                    if let Ok(child) = xprv.derive_priv(&secp2, &deriv) {
+                        let pub2 = PublicKey::new(child.private_key.public_key(&secp2));
+                        let addr = Address::p2pkh(&pub2, Network::Bitcoin);
+                        println!("Derived address: {addr}");
+                    }
+                }
+            }
+            TargetMode::Pubkey(pk) => println!("Matched pubkey: {}", bytes_to_hex(pk)),
+        }
         Ok(true)
     } else {
         Ok(false)
@@ -940,6 +1012,10 @@ pub fn format_number(n: usize) -> String {
     }
 }
 
+fn bytes_to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
 fn parse_language(lang: &str) -> Result<Language> {
     match lang.to_lowercase().as_str() {
         "english"             => Ok(Language::English),
@@ -956,6 +1032,60 @@ fn parse_language(lang: &str) -> Result<Language> {
             "Unknown language '{lang}'. Supported: english, portuguese, spanish, \
              french, italian, czech, korean, japanese, chinese-simplified, \
              chinese-traditional"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Target mode: address (hash160) or raw pubkey
+// ---------------------------------------------------------------------------
+
+/// What the search compares against.
+#[derive(Clone, Debug)]
+pub enum TargetMode {
+    /// Compare derived hash160 against a 20-byte value extracted from a P2PKH address.
+    Hash160([u8; 20]),
+    /// Compare derived compressed pubkey (33 bytes) directly — skips SHA256+RIPEMD160.
+    /// Faster per candidate than Hash160 mode.
+    Pubkey([u8; 33]),
+}
+
+/// Parse a hex pubkey string (66 or 130 hex chars) into a compressed 33-byte key.
+/// Uncompressed keys (04 prefix, 130 chars) are compressed on the fly.
+fn parse_pubkey_hex(hex: &str) -> Result<[u8; 33]> {
+    let hex = hex.trim();
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .context("Invalid hex in --target-pubkey")?;
+
+    match bytes.len() {
+        33 => {
+            // Compressed — validate prefix.
+            anyhow::ensure!(
+                bytes[0] == 0x02 || bytes[0] == 0x03,
+                "--target-pubkey: compressed key must start with 02 or 03, got {:02x}",
+                bytes[0]
+            );
+            let mut out = [0u8; 33];
+            out.copy_from_slice(&bytes);
+            Ok(out)
+        }
+        65 => {
+            // Uncompressed — convert to compressed via secp256k1.
+            anyhow::ensure!(
+                bytes[0] == 0x04,
+                "--target-pubkey: uncompressed key must start with 04, got {:02x}",
+                bytes[0]
+            );
+            let pk = Secp256k1PubKey::from_slice(&bytes)
+                .context("--target-pubkey: invalid uncompressed pubkey bytes")?;
+            Ok(pk.serialize()) // always compressed 33 bytes
+        }
+        n => anyhow::bail!(
+            "--target-pubkey must be 66 hex chars (compressed) or 130 hex chars (uncompressed), got {} hex chars ({} bytes)",
+            hex.len(), n
         ),
     }
 }
