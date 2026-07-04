@@ -261,7 +261,6 @@ impl Gpu {
 
         let mut buf: Vec<u16> = Vec::with_capacity(batch_size * 12);
         let mut batch_start: usize = 0;
-        let mut checked: usize = 0;
         let block = 256u32;
         let stream = &self.stream;
         let mut it = candidates;
@@ -330,9 +329,7 @@ impl Gpu {
                 }));
             }
 
-            checked += n;
             batch_start += n;
-            println!("Checked {} candidates...", crate::format_number(checked));
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
@@ -360,7 +357,6 @@ impl Gpu {
 
         let mut buf: Vec<u16> = Vec::with_capacity(batch_size * 12);
         let mut batch_start: usize = 0;
-        let mut checked: usize = 0;
         let block = 256u32;
         let stream = &self.stream;
         let mut it = candidates;
@@ -429,9 +425,7 @@ impl Gpu {
                 }));
             }
 
-            checked += n;
             batch_start += n;
-            println!("Checked {} candidates...", crate::format_number(checked));
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
