@@ -349,6 +349,49 @@ __device__ void hmac512_compute(const hmac512_ctx* h, const u8* msg, u32 msglen,
     sha512_final(&ou, out);
 }
 
+// Optimized HMAC for fixed 64-byte message (used in PBKDF2 inner loop).
+// Avoids sha512_update branching and copies by computing the padding block directly.
+// The inner precomputed state already consumed the 128-byte ipad block.
+// Now we append the 64-byte message + SHA-512 padding (1 block = 128 bytes total),
+// then feed the 64-byte inner hash into the precomputed outer state.
+__device__ __forceinline__ void hmac512_compute_64(
+        const hmac512_ctx* h, const u8 msg[64], u8 out[64]) {
+    // ── Inner: init from precomputed midstate, then one 128-byte block ──
+    // Block = msg[64] || 0x80 || zeros[55] || bitlen(64+128=192 bytes = 1536 bits)
+    // 1536 in big-endian u128 = 0x0000000000000600 in the low 64 bits.
+    u8 blk[128];
+    for (int i = 0;  i < 64; i++) blk[i] = msg[i];
+    blk[64] = 0x80;
+    for (int i = 65; i < 120; i++) blk[i] = 0;
+    // Length = (128 + 64) * 8 = 1536 bits = 0x600, stored as 128-bit big-endian.
+    // High 8 bytes = 0, low 8 bytes = 0x0000000000000600.
+    blk[120] = 0; blk[121] = 0; blk[122] = 0; blk[123] = 0;
+    blk[124] = 0; blk[125] = 0; blk[126] = 0x06; blk[127] = 0x00;
+
+    u64 ih[8];
+    for (int i = 0; i < 8; i++) ih[i] = h->inner.h[i];
+    sha512_transform(ih, blk);
+
+    // Serialise inner hash to bytes.
+    u8 ih_bytes[64];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++) ih_bytes[i*8+j] = (u8)(ih[i] >> (56 - j*8));
+
+    // ── Outer: same idea — precomputed midstate + 64-byte inner hash ──
+    for (int i = 0;  i < 64; i++) blk[i] = ih_bytes[i];
+    blk[64] = 0x80;
+    for (int i = 65; i < 120; i++) blk[i] = 0;
+    blk[120] = 0; blk[121] = 0; blk[122] = 0; blk[123] = 0;
+    blk[124] = 0; blk[125] = 0; blk[126] = 0x06; blk[127] = 0x00;
+
+    u64 oh[8];
+    for (int i = 0; i < 8; i++) oh[i] = h->outer.h[i];
+    sha512_transform(oh, blk);
+
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++) out[i*8+j] = (u8)(oh[i] >> (56 - j*8));
+}
+
 __device__ void hmac_sha512(const u8* key, u32 keylen, const u8* msg, u32 msglen, u8 out[64]) {
     hmac512_ctx h; hmac512_init(&h, key, keylen);
     hmac512_compute(&h, msg, msglen, out);
@@ -382,9 +425,12 @@ __device__ __noinline__ void pbkdf2_hmac_sha512_64(
     }
     for (int i = 0; i < 64; i++) out[i] = u[i];
 
+    // Inner loop: use fixed-64-byte optimized HMAC to skip branching overhead.
+    // hmac512_compute_64 assumes msg is always exactly 64 bytes, which is true
+    // for all iterations after U1 (each U[i] is the 64-byte output of the previous).
     for (u32 iter = 1; iter < iters; iter++) {
         u8 t[64];
-        hmac512_compute(&h, u, 64, t);
+        hmac512_compute_64(&h, u, t);
         for (int i = 0; i < 64; i++) { out[i] ^= t[i]; u[i] = t[i]; }
     }
 }
