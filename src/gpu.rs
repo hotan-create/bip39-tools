@@ -24,6 +24,18 @@ impl Gpu {
         let module = Module::from_ptx(PTX, &[]).context("loading kernels PTX")?;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("creating CUDA stream")?;
+
+        // Build the fixed-base window table of multiples of G. Every kernel that
+        // derives a public key reads it, so it must run before anything else.
+        let init = module
+            .get_function("k_init_gtable")
+            .context("loading k_init_gtable")?;
+        unsafe {
+            launch!(init<<<(64 * 15 + 255) / 256, 256, 0, stream>>>())
+                .context("launching k_init_gtable")?;
+        }
+        stream.synchronize().context("building G table")?;
+
         Ok(Self {
             _context,
             module,
@@ -112,12 +124,21 @@ impl Gpu {
 
     /// One 20-byte P2PKH hash160 (path m/44'/0'/0'/0/0) per 64-byte seed.
     fn seed_to_hash160_batch(&self, seeds: &[[u8; 64]]) -> Result<Vec<[u8; 20]>> {
+        self.seed_to_20_batch("k_seed_to_hash160", seeds)
+    }
+
+    /// One 20-byte ETH address (path m/44'/60'/0'/0/0) per 64-byte seed.
+    fn seed_to_eth_batch(&self, seeds: &[[u8; 64]]) -> Result<Vec<[u8; 20]>> {
+        self.seed_to_20_batch("k_seed_to_eth_address", seeds)
+    }
+
+    fn seed_to_20_batch(&self, kernel: &str, seeds: &[[u8; 64]]) -> Result<Vec<[u8; 20]>> {
         let n = seeds.len();
         let flat: Vec<u8> = seeds.iter().flatten().copied().collect();
         let d_seed = DeviceBuffer::from_slice(&flat)?;
         let d_out = DeviceBuffer::from_slice(&vec![0u8; n * 20])?;
 
-        let func = self.module.get_function("k_seed_to_hash160")?;
+        let func = self.module.get_function(kernel)?;
         let (grid, block) = launch_dims(n);
         let stream = &self.stream;
         unsafe {
@@ -129,6 +150,12 @@ impl Gpu {
         let mut out = vec![0u8; n * 20];
         d_out.copy_to(&mut out)?;
         Ok(out.chunks(20).map(|c| c.try_into().unwrap()).collect())
+    }
+
+    /// One 32-byte Keccak-256 digest per input (Ethereum's domain byte 0x01,
+    /// not NIST SHA3-256's 0x06).
+    fn keccak256_batch(&self, inputs: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        self.hash_batch("k_keccak256", inputs, 32)
     }
 
     /// One (a + b) mod n per pair, all 32-byte big-endian.
@@ -241,47 +268,77 @@ pub struct SearchHit {
 
 impl Gpu {
     /// Searches `candidates` (an iterator of 12 word-index arrays) for one whose
-    /// derived P2PKH hash160 equals `target_h160`. Streams in batches so memory
-    /// stays flat. `report_every` controls progress logging cadence.
+    /// derived 20-byte target address equals `target_addr`. `pipeline_kernel`
+    /// selects the coin's derivation: `"k_pipeline"` for BTC P2PKH hash160,
+    /// `"k_pipeline_eth"` for ETH's Keccak256-based address. Streams in
+    /// batches so memory stays flat. `report_every` controls progress logging
+    /// cadence.
     pub fn search(
         &self,
-        candidates: impl Iterator<Item = [u16; 12]>,
+        candidates: impl Iterator<Item = [u16; 12]> + Send + 'static,
         wordlist: &GpuWordlist,
-        target_h160: &[u8; 20],
+        target_addr: &[u8; 20],
         batch_size: usize,
+        pipeline_kernel: &str,
     ) -> Result<Option<SearchHit>> {
         let d_wordlist = DeviceBuffer::from_slice(&wordlist.packed)?;
         let d_lens = DeviceBuffer::from_slice(&wordlist.lens)?;
-        let d_target = DeviceBuffer::from_slice(target_h160)?;
+        let d_target = DeviceBuffer::from_slice(target_addr)?;
         let filter = self.module.get_function("k_filter")?;
-        let pipeline = self.module.get_function("k_pipeline")?;
+        let pipeline = self.module.get_function(pipeline_kernel)?;
 
-        // Reusable device buffers (sized for a full batch).
+        // All device buffers are allocated once and reused. Allocating inside
+        // the loop cost four cudaMalloc/cudaFree pairs per batch, each of which
+        // implicitly synchronizes the device.
         let d_survivors = unsafe { DeviceBuffer::<u32>::uninitialized(batch_size)? };
+        let d_cand = unsafe { DeviceBuffer::<u16>::uninitialized(batch_size * 12)? };
+        let mut d_counter = DeviceBuffer::from_slice(&[0u32])?;
+        let d_found_flag = DeviceBuffer::from_slice(&[0u32])?;
+        let d_found_idx = DeviceBuffer::from_slice(&[0u32])?;
 
-        let mut buf: Vec<u16> = Vec::with_capacity(batch_size * 12);
-        let mut batch_start: usize = 0;
-        let block = 256u32;
-        let stream = &self.stream;
-        let mut it = candidates;
-
-        loop {
-            buf.clear();
-            for _ in 0..batch_size {
-                match it.next() {
-                    Some(c) => buf.extend_from_slice(&c),
-                    None => break,
+        // Generating a batch takes ~10-15% of the time the GPU spends on it, and
+        // it used to run between launches with the device idle. A producer thread
+        // fills the next batch while the current one is in flight; buffers cycle
+        // back over `empty` so nothing is reallocated.
+        let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<Vec<u16>>(1);
+        let (empty_tx, empty_rx) = std::sync::mpsc::channel::<Vec<u16>>();
+        for _ in 0..2 {
+            let _ = empty_tx.send(Vec::with_capacity(batch_size * 12));
+        }
+        let producer = std::thread::spawn(move || {
+            let mut it = candidates;
+            while let Ok(mut buf) = empty_rx.recv() {
+                buf.clear();
+                for _ in 0..batch_size {
+                    match it.next() {
+                        Some(c) => buf.extend_from_slice(&c),
+                        None => break,
+                    }
+                }
+                let last = buf.len() < batch_size * 12;
+                // A send error just means the consumer stopped (hit found).
+                if full_tx.send(buf).is_err() || last {
+                    return;
                 }
             }
+        });
+
+        let mut batch_start: usize = 0;
+        let block = 64u32;
+        let stream = &self.stream;
+
+        let result = loop {
+            let buf = match full_rx.recv() {
+                Ok(b) => b,
+                Err(_) => break None, // producer finished
+            };
             if buf.is_empty() {
-                return Ok(None);
+                break None;
             }
             let n = buf.len() / 12;
 
-            let d_cand = DeviceBuffer::from_slice(&buf)?;
-            let d_counter = DeviceBuffer::from_slice(&[0u32])?;
-            let d_found_flag = DeviceBuffer::from_slice(&[0u32])?;
-            let d_found_idx = DeviceBuffer::from_slice(&[0u32])?;
+            d_cand.index(0..buf.len()).copy_from(&buf[..])?;
+            d_counter.copy_from(&[0u32])?;
 
             // Pass 1: checksum filter -> compacted survivors.
             let grid = ((n as u32) + block - 1) / block;
@@ -323,114 +380,32 @@ impl Gpu {
                 let local = found_idx[0] as usize;
                 let mut indices = [0u16; 12];
                 indices.copy_from_slice(&buf[local * 12..local * 12 + 12]);
-                return Ok(Some(SearchHit {
+                break Some(SearchHit {
                     global_index: batch_start + local,
                     indices,
-                }));
+                });
             }
 
             batch_start += n;
+            let short_batch = n < batch_size;
+            let _ = empty_tx.send(buf);
             use std::io::Write;
             let _ = std::io::stdout().flush();
-        }
+            if short_batch {
+                break None; // last (partial) batch
+            }
+        };
+
+        // Break out of the loop early (a hit) and the producer may be parked in
+        // either direction, so both of its peers have to go before the join:
+        // dropping the receiver fails its pending send, dropping the sender ends
+        // its wait for the next empty buffer.
+        drop(full_rx);
+        drop(empty_tx);
+        let _ = producer.join();
+        Ok(result)
     }
-
-    /// Like `search()` but compares the derived **compressed public key** (33 bytes)
-    /// instead of hash160. Skips the SHA256+RIPEMD160 step on the GPU kernel,
-    /// making each candidate slightly faster to evaluate.
-    ///
-    /// Uses `k_filter` (same BIP-39 checksum filter) + `k_pipeline_pubkey` (new kernel).
-    pub fn search_pubkey(
-        &self,
-        candidates: impl Iterator<Item = [u16; 12]>,
-        wordlist: &GpuWordlist,
-        target_pubkey: &[u8; 33],
-        batch_size: usize,
-    ) -> Result<Option<SearchHit>> {
-        let d_wordlist = DeviceBuffer::from_slice(&wordlist.packed)?;
-        let d_lens     = DeviceBuffer::from_slice(&wordlist.lens)?;
-        let d_target   = DeviceBuffer::from_slice(target_pubkey.as_ref())?;
-        let filter     = self.module.get_function("k_filter")?;
-        let pipeline   = self.module.get_function("k_pipeline_pubkey")?;
-
-        let d_survivors = unsafe { DeviceBuffer::<u32>::uninitialized(batch_size)? };
-
-        let mut buf: Vec<u16> = Vec::with_capacity(batch_size * 12);
-        let mut batch_start: usize = 0;
-        let block = 256u32;
-        let stream = &self.stream;
-        let mut it = candidates;
-
-        loop {
-            buf.clear();
-            for _ in 0..batch_size {
-                match it.next() {
-                    Some(c) => buf.extend_from_slice(&c),
-                    None    => break,
-                }
-            }
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            let n = buf.len() / 12;
-
-            let d_cand       = DeviceBuffer::from_slice(&buf)?;
-            let d_counter    = DeviceBuffer::from_slice(&[0u32])?;
-            let d_found_flag = DeviceBuffer::from_slice(&[0u32])?;
-            let d_found_idx  = DeviceBuffer::from_slice(&[0u32])?;
-
-            // Pass 1: BIP-39 checksum filter (same as hash160 path).
-            let grid = ((n as u32) + block - 1) / block;
-            unsafe {
-                launch!(filter<<<grid, block, 0, stream>>>(
-                    d_cand.as_device_ptr(), n as u32,
-                    d_survivors.as_device_ptr(), d_counter.as_device_ptr()
-                ))?;
-            }
-            stream.synchronize()?;
-            let mut counter = [0u32];
-            d_counter.copy_to(&mut counter)?;
-            let count = counter[0];
-
-            // Pass 2: derive pubkey, compare — no hash160.
-            if count > 0 {
-                let grid2 = (count + block - 1) / block;
-                unsafe {
-                    launch!(pipeline<<<grid2, block, 0, stream>>>(
-                        d_cand.as_device_ptr(),
-                        d_survivors.as_device_ptr(),
-                        count,
-                        d_wordlist.as_device_ptr(),
-                        d_lens.as_device_ptr(),
-                        wordlist.stride as u32,
-                        d_target.as_device_ptr(),
-                        d_found_flag.as_device_ptr(),
-                        d_found_idx.as_device_ptr()
-                    ))?;
-                }
-                stream.synchronize()?;
-            }
-
-            let mut found_flag = [0u32];
-            d_found_flag.copy_to(&mut found_flag)?;
-            if found_flag[0] != 0 {
-                let mut found_idx = [0u32];
-                d_found_idx.copy_to(&mut found_idx)?;
-                let local = found_idx[0] as usize;
-                let mut indices = [0u16; 12];
-                indices.copy_from_slice(&buf[local * 12..local * 12 + 12]);
-                return Ok(Some(SearchHit {
-                    global_index: batch_start + local,
-                    indices,
-                }));
-            }
-
-            batch_start += n;
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-    }
-} // end impl Gpu
+}
 
 /// Runs all primitive selftests, printing PASS/FAIL per primitive. Returns
 /// `Ok(true)` iff every check passed.
@@ -477,6 +452,16 @@ pub fn run_selftest() -> Result<bool> {
     });
     report("RIPEMD-160", ripemd_ok, &mut all_ok);
 
+    // --- Keccak-256 (vs sha3 crate; single-block inputs, len < 136) ---
+    use sha3::{Digest, Keccak256};
+    let kmsgs: Vec<Vec<u8>> = msgs.iter().filter(|m| m.len() < 136).cloned().collect();
+    let got = gpu.keccak256_batch(&kmsgs)?;
+    let keccak_ok = kmsgs.iter().zip(&got).all(|(m, g)| {
+        let want = Keccak256::digest(m);
+        g.as_slice() == want.as_slice()
+    });
+    report("Keccak-256", keccak_ok, &mut all_ok);
+
     // --- HMAC-SHA512 (vs bitcoin_hashes HmacEngine) ---
     // Keys chosen to cross the 128-byte block boundary (short, exactly-block, oversized).
     let hkeys: Vec<Vec<u8>> = vec![
@@ -518,6 +503,21 @@ pub fn run_selftest() -> Result<bool> {
         salts.push(b"mnemonic".to_vec());
         want_seeds.push(m.to_seed("").to_vec());
     }
+    // A Japanese mnemonic is ~220 bytes of UTF-8, past HMAC's 128-byte block, so
+    // the key gets hashed before use. English phrases never reach that path.
+    // Built from entropy rather than a literal: the wordlist is NFKD, in which
+    // dakuten are separate code points, so a composed literal would not match.
+    let m = Mnemonic::from_entropy_in(Language::Japanese, &[0u8; 16])?;
+    let jp_bytes = m.to_string().into_bytes();
+    anyhow::ensure!(
+        jp_bytes.len() > 128,
+        "expected the Japanese mnemonic to exceed one HMAC block, got {}",
+        jp_bytes.len()
+    );
+    pws.push(jp_bytes);
+    salts.push(b"mnemonic".to_vec());
+    want_seeds.push(m.to_seed("").to_vec());
+
     let got = gpu.pbkdf2_batch(&pws, &salts, 2048)?;
     let pbkdf2_ok = got.iter().zip(&want_seeds).all(|(g, w)| g == w);
     report("PBKDF2-HMAC-SHA512 / BIP-39 seed", pbkdf2_ok, &mut all_ok);
@@ -587,6 +587,25 @@ pub fn run_selftest() -> Result<bool> {
     let got = gpu.seed_to_hash160_batch(&seeds)?;
     let bip32_ok = got.iter().zip(&want_h160).all(|(g, w)| g == w);
     report("BIP32 m/44'/0'/0'/0/0 seed->hash160", bip32_ok, &mut all_ok);
+
+    // --- BIP32 m/44'/60'/0'/0/0 seed -> ETH address (vs bitcoin + sha3 crates) ---
+    let path_eth: DerivationPath = "m/44'/60'/0'/0/0".parse()?;
+    let mut want_eth: Vec<[u8; 20]> = Vec::new();
+    for p in phrases {
+        let m = Mnemonic::parse_in_normalized(Language::English, p)?;
+        let seed = m.to_seed("");
+        let xprv = Xpriv::new_master(Network::Bitcoin, &seed)?;
+        let child = xprv.derive_priv(&secp, &path_eth)?;
+        let pubkey = PublicKey::from_secret_key(&secp, &child.private_key);
+        let uncompressed = pubkey.serialize_uncompressed();
+        let hash = Keccak256::digest(&uncompressed[1..]);
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&hash[12..]);
+        want_eth.push(addr);
+    }
+    let got = gpu.seed_to_eth_batch(&seeds)?;
+    let eth_ok = got.iter().zip(&want_eth).all(|(g, w)| g == w);
+    report("BIP32 m/44'/60'/0'/0/0 seed->ETH address", eth_ok, &mut all_ok);
 
     Ok(all_ok)
 }
