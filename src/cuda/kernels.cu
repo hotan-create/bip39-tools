@@ -1,11 +1,12 @@
 // CUDA device implementation of the words-breaker hot path.
 //
 // Each primitive was built and verified against the CPU crates via `--selftest`
-// (see src/gpu.rs): SHA-256, SHA-512, RIPEMD-160, HMAC-SHA512, PBKDF2, secp256k1
-// (priv->pubkey and scalar add mod n), and BIP32 m/44'/0'/0'/0/0 seed->hash160.
-// The full search is split into k_filter (cheap BIP-39 checksum, compacting
-// survivors) and k_pipeline (heavy derivation), so the heavy pass has no warp
-// divergence.
+// (see src/gpu.rs): SHA-256, SHA-512, RIPEMD-160, Keccak-256, HMAC-SHA512,
+// PBKDF2, secp256k1 (priv->pubkey and scalar add mod n), BIP32
+// m/44'/0'/0'/0/0 seed->hash160 (BTC), and BIP32 m/44'/60'/0'/0/0
+// seed->address (ETH). The full search is split into k_filter (cheap BIP-39
+// checksum, compacting survivors) and a heavy pipeline kernel — k_pipeline for
+// BTC, k_pipeline_eth for ETH — so the heavy pass has no warp divergence.
 //
 // All multi-byte values follow the relevant standard's byte order (big-endian
 // for SHA, little-endian for RIPEMD-160), independent of GPU endianness, so the
@@ -20,6 +21,7 @@ typedef uint64_t u64;
 __device__ __forceinline__ u32 rotr32(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }
 __device__ __forceinline__ u32 rotl32(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
 __device__ __forceinline__ u64 rotr64(u64 x, u32 n) { return (x >> n) | (x << (64 - n)); }
+__device__ __forceinline__ u64 rotl64(u64 x, u32 n) { return (x << n) | (x >> (64 - n)); }
 
 __device__ __forceinline__ void dmemcpy(u8* dst, const u8* src, u32 n) {
     for (u32 i = 0; i < n; i++) dst[i] = src[i];
@@ -146,25 +148,27 @@ __constant__ u64 K512[80] = {
 
 typedef struct { u64 h[8]; u64 total; u8 buf[128]; u32 n; } sha512_ctx;
 
+__device__ __forceinline__ void sha512_iv(u64 h[8]) {
+    h[0]=0x6a09e667f3bcc908ULL; h[1]=0xbb67ae8584caa73bULL;
+    h[2]=0x3c6ef372fe94f82bULL; h[3]=0xa54ff53a5f1d36f1ULL;
+    h[4]=0x510e527fade682d1ULL; h[5]=0x9b05688c2b3e6c1fULL;
+    h[6]=0x1f83d9abfb41bd6bULL; h[7]=0x5be0cd19137e2179ULL;
+}
+
 __device__ void sha512_init(sha512_ctx* c) {
-    c->h[0]=0x6a09e667f3bcc908ULL; c->h[1]=0xbb67ae8584caa73bULL;
-    c->h[2]=0x3c6ef372fe94f82bULL; c->h[3]=0xa54ff53a5f1d36f1ULL;
-    c->h[4]=0x510e527fade682d1ULL; c->h[5]=0x9b05688c2b3e6c1fULL;
-    c->h[6]=0x1f83d9abfb41bd6bULL; c->h[7]=0x5be0cd19137e2179ULL;
+    sha512_iv(c->h);
     c->total = 0; c->n = 0;
 }
 
-__device__ void sha512_transform(u64 h[8], const u8 block[128]) {
-    // 16-word rolling message schedule (see sha256_transform): keeps only 16 of
-    // the 80 schedule words live, which is a big register/local-memory win for
-    // the 64-bit state — and SHA-512 is the hot primitive (PBKDF2 runs it 4096x
-    // per candidate).
-    u64 w[16];
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        w[i] = ((u64)block[i*8]<<56)|((u64)block[i*8+1]<<48)|((u64)block[i*8+2]<<40)|((u64)block[i*8+3]<<32)
-             |((u64)block[i*8+4]<<24)|((u64)block[i*8+5]<<16)|((u64)block[i*8+6]<<8)|((u64)block[i*8+7]);
-    }
+// Compression function over a message block already held as 16 big-endian words.
+// Taking `w` by value (rather than a `const u8[128]` buffer) is what keeps the
+// hot PBKDF2 loop entirely in registers: no local-memory block to memcpy into,
+// and no byte-at-a-time reassembly of the schedule. `w` is clobbered.
+//
+// Callers that pass compile-time-constant padding words (see pbkdf2_bip39_seed,
+// where w[8..15] are fixed) get the first schedule rounds constant-folded for
+// free, because the full unroll makes every w index a constant.
+__device__ __forceinline__ void sha512_block(u64 h[8], u64 w[16]) {
     u64 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
     #pragma unroll
     for (int i = 0; i < 80; i++) {
@@ -180,14 +184,26 @@ __device__ void sha512_transform(u64 h[8], const u8 block[128]) {
             w[i & 15] = wi;
         }
         u64 S1 = rotr64(e,14) ^ rotr64(e,18) ^ rotr64(e,41);
-        u64 ch = (e & f) ^ ((~e) & g);
+        u64 ch = g ^ (e & (f ^ g));               // == (e&f) ^ (~e&g), one op cheaper
         u64 t1 = hh + S1 + ch + K512[i] + wi;
         u64 S0 = rotr64(a,28) ^ rotr64(a,34) ^ rotr64(a,39);
-        u64 maj = (a & b) ^ (a & c) ^ (b & c);
+        u64 maj = (a & b) ^ (c & (a ^ b));        // == (a&b)^(a&c)^(b&c), two ops cheaper
         u64 t2 = S0 + maj;
         hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
     }
     h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+}
+
+// Byte-buffer wrapper, for the streaming ctx used by the selftest kernels and
+// the (cold) BIP32 HMACs.
+__device__ void sha512_transform(u64 h[8], const u8 block[128]) {
+    u64 w[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((u64)block[i*8]<<56)|((u64)block[i*8+1]<<48)|((u64)block[i*8+2]<<40)|((u64)block[i*8+3]<<32)
+             |((u64)block[i*8+4]<<24)|((u64)block[i*8+5]<<16)|((u64)block[i*8+6]<<8)|((u64)block[i*8+7]);
+    }
+    sha512_block(h, w);
 }
 
 __device__ void sha512_update(sha512_ctx* c, const u8* data, u32 len) {
@@ -312,6 +328,93 @@ __device__ void ripemd160(const u8* msg, u32 len, u8 out[20]) {
 }
 
 // ===========================================================================
+// Keccak-256 (the original Keccak padding/domain byte 0x01, as used by
+// Ethereum — NOT NIST SHA3-256, which uses domain byte 0x06). Used only to
+// turn an uncompressed secp256k1 pubkey into an ETH address.
+// ===========================================================================
+
+__constant__ u64 KECCAK_RC[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
+    0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+    0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+    0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
+    0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL,
+};
+__constant__ int KECCAK_ROTC[24] = {
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+};
+__constant__ int KECCAK_PILN[24] = {
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+};
+
+// In-place Keccak-f[1600] permutation on a 25-lane (1600-bit) state.
+__device__ void keccakf(u64 st[25]) {
+    u64 bc[5], t;
+    #pragma unroll
+    for (int round = 0; round < 24; round++) {
+        // Theta
+        #pragma unroll
+        for (int i = 0; i < 5; i++) bc[i] = st[i] ^ st[i+5] ^ st[i+10] ^ st[i+15] ^ st[i+20];
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            t = bc[(i+4)%5] ^ rotl64(bc[(i+1)%5], 1);
+            #pragma unroll
+            for (int j = 0; j < 25; j += 5) st[j+i] ^= t;
+        }
+        // Rho + Pi
+        t = st[1];
+        #pragma unroll
+        for (int i = 0; i < 24; i++) {
+            int j = KECCAK_PILN[i];
+            u64 tmp = st[j];
+            st[j] = rotl64(t, KECCAK_ROTC[i]);
+            t = tmp;
+        }
+        // Chi
+        #pragma unroll
+        for (int j = 0; j < 25; j += 5) {
+            #pragma unroll
+            for (int i = 0; i < 5; i++) bc[i] = st[j+i];
+            #pragma unroll
+            for (int i = 0; i < 5; i++) st[j+i] ^= (~bc[(i+1)%5]) & bc[(i+2)%5];
+        }
+        // Iota
+        st[0] ^= KECCAK_RC[round];
+    }
+}
+
+// Keccak-256, single-block only (len must be < 136-byte rate — our only
+// caller hashes a fixed 64-byte X||Y pubkey, well within that).
+__device__ void keccak256(const u8* data, u32 len, u8 out[32]) {
+    u64 st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) st[i] = 0;
+
+    const u32 rate = 136;
+    u8 block[136];
+    for (u32 i = 0; i < rate; i++) block[i] = (i < len) ? data[i] : 0;
+    block[len]      ^= 0x01; // Keccak (pre-NIST) domain separator, not SHA3's 0x06
+    block[rate - 1] ^= 0x80;
+
+    #pragma unroll
+    for (int i = 0; i < 17; i++) {
+        u64 lane = 0;
+        #pragma unroll
+        for (int b = 0; b < 8; b++) lane |= (u64)block[i*8+b] << (8*b);
+        st[i] ^= lane;
+    }
+    keccakf(st);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 lane = st[i];
+        #pragma unroll
+        for (int b = 0; b < 8; b++) out[i*8+b] = (u8)(lane >> (8*b));
+    }
+}
+
+// ===========================================================================
 // HMAC-SHA512 (RFC 2104) with precomputed inner/outer midstates.
 //
 // The key-dependent first block of each SHA-512 (ipad/opad) is hashed once in
@@ -349,49 +452,6 @@ __device__ void hmac512_compute(const hmac512_ctx* h, const u8* msg, u32 msglen,
     sha512_final(&ou, out);
 }
 
-// Optimized HMAC for fixed 64-byte message (used in PBKDF2 inner loop).
-// Avoids sha512_update branching and copies by computing the padding block directly.
-// The inner precomputed state already consumed the 128-byte ipad block.
-// Now we append the 64-byte message + SHA-512 padding (1 block = 128 bytes total),
-// then feed the 64-byte inner hash into the precomputed outer state.
-__device__ __forceinline__ void hmac512_compute_64(
-        const hmac512_ctx* h, const u8 msg[64], u8 out[64]) {
-    // ── Inner: init from precomputed midstate, then one 128-byte block ──
-    // Block = msg[64] || 0x80 || zeros[55] || bitlen(64+128=192 bytes = 1536 bits)
-    // 1536 in big-endian u128 = 0x0000000000000600 in the low 64 bits.
-    u8 blk[128];
-    for (int i = 0;  i < 64; i++) blk[i] = msg[i];
-    blk[64] = 0x80;
-    for (int i = 65; i < 120; i++) blk[i] = 0;
-    // Length = (128 + 64) * 8 = 1536 bits = 0x600, stored as 128-bit big-endian.
-    // High 8 bytes = 0, low 8 bytes = 0x0000000000000600.
-    blk[120] = 0; blk[121] = 0; blk[122] = 0; blk[123] = 0;
-    blk[124] = 0; blk[125] = 0; blk[126] = 0x06; blk[127] = 0x00;
-
-    u64 ih[8];
-    for (int i = 0; i < 8; i++) ih[i] = h->inner.h[i];
-    sha512_transform(ih, blk);
-
-    // Serialise inner hash to bytes.
-    u8 ih_bytes[64];
-    for (int i = 0; i < 8; i++)
-        for (int j = 0; j < 8; j++) ih_bytes[i*8+j] = (u8)(ih[i] >> (56 - j*8));
-
-    // ── Outer: same idea — precomputed midstate + 64-byte inner hash ──
-    for (int i = 0;  i < 64; i++) blk[i] = ih_bytes[i];
-    blk[64] = 0x80;
-    for (int i = 65; i < 120; i++) blk[i] = 0;
-    blk[120] = 0; blk[121] = 0; blk[122] = 0; blk[123] = 0;
-    blk[124] = 0; blk[125] = 0; blk[126] = 0x06; blk[127] = 0x00;
-
-    u64 oh[8];
-    for (int i = 0; i < 8; i++) oh[i] = h->outer.h[i];
-    sha512_transform(oh, blk);
-
-    for (int i = 0; i < 8; i++)
-        for (int j = 0; j < 8; j++) out[i*8+j] = (u8)(oh[i] >> (56 - j*8));
-}
-
 __device__ void hmac_sha512(const u8* key, u32 keylen, const u8* msg, u32 msglen, u8 out[64]) {
     hmac512_ctx h; hmac512_init(&h, key, keylen);
     hmac512_compute(&h, msg, msglen, out);
@@ -407,32 +467,143 @@ __device__ void hmac_sha512(const u8* key, u32 keylen, const u8* msg, u32 msglen
 // pbkdf2 produces a wrong seed (verified: the standalone kernels are correct, but
 // the inlined combination corrupts the result). Keeping each as its own frame
 // matches the individually-verified kernels bit-for-bit. Do not remove.
+//
+// This is ~94% of the search's total cost (measured), so it is the one routine
+// worth specializing hard. Two facts make the hot loop completely regular:
+//
+//   * dkLen == 64, so there is exactly one output block and no outer loop;
+//   * every U_i is 64 bytes, so each of the two HMAC halves per iteration is a
+//     SHA-512 over exactly one block, whose layout is fixed:
+//         W[0..7] = U_i,  W[8] = 0x80<<56,  W[9..14] = 0,  W[15] = (128+64)*8.
+//
+// So the 2048 iterations reduce to 4096 calls of sha512_block on state and
+// message words that live entirely in registers. U is carried as 8 u64 rather
+// than 64 bytes, which removes the byte<->word repacking as well. Compare the
+// generic path this replaces: two 204-byte ctx copies plus ~250 byte-wise
+// local-memory writes per iteration.
 __device__ __noinline__ void pbkdf2_hmac_sha512_64(
     const u8* pw, u32 pwlen, const u8* salt, u32 saltlen, u32 iters, u8 out[64]) {
-    hmac512_ctx h; hmac512_init(&h, pw, pwlen);
+    // ---- key -> ipad/opad midstates (each one compression, done once) ----
+    u64 kw[16];
+    if (pwlen > 128) {
+        u8 t[64]; sha512(pw, pwlen, t);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            u64 v = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) v = (v << 8) | t[i*8 + j];
+            kw[i] = v;
+        }
+        #pragma unroll
+        for (int i = 8; i < 16; i++) kw[i] = 0;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            u64 v = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                u32 o = (u32)(i*8 + j);
+                v = (v << 8) | (u64)(o < pwlen ? pw[o] : 0);
+            }
+            kw[i] = v;
+        }
+    }
 
-    // U1 = HMAC(pw, salt || INT32BE(1))
-    u8 u[64];
-    {
-        sha512_ctx in = h.inner;
-        sha512_update(&in, salt, saltlen);
+    u64 inner[8], outer[8], w[16];
+    sha512_iv(inner);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) w[i] = kw[i] ^ 0x3636363636363636ULL;
+    sha512_block(inner, w);
+    sha512_iv(outer);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) w[i] = kw[i] ^ 0x5c5c5c5c5c5c5c5cULL;
+    sha512_block(outer, w);
+
+    // ---- U1 = HMAC(pw, salt || INT32BE(1)) ----
+    // One compression out of ~4097, so a byte buffer here costs nothing and
+    // keeps arbitrary salt lengths (BIP-39 salt = "mnemonic" || passphrase)
+    // working. saltlen+4 <= 111 keeps it to the single-block case; longer salts
+    // fall back to streaming.
+    u64 u[8], acc[8], st[8];
+    if (saltlen + 4 <= 111) {
+        u8 blk[128];
+        u32 n = 0;
+        for (u32 i = 0; i < saltlen; i++) blk[n++] = salt[i];
+        blk[n++] = 0; blk[n++] = 0; blk[n++] = 0; blk[n++] = 1;   // INT32BE(1)
+        blk[n++] = 0x80;
+        while (n < 120) blk[n++] = 0;
+        u64 bits = (u64)(128 + saltlen + 4) * 8;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) blk[120 + i] = (u8)(bits >> (56 - i*8));
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            u64 v = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) v = (v << 8) | blk[i*8 + j];
+            w[i] = v;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) st[i] = inner[i];
+        sha512_block(st, w);
+    } else {
+        // Long salt: stream it, starting from the ipad midstate (128 bytes of
+        // ipad block are already absorbed, hence total = 128).
+        sha512_ctx in;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) in.h[i] = inner[i];
+        in.total = 128; in.n = 0;
         u8 idx[4] = {0, 0, 0, 1};
+        sha512_update(&in, salt, saltlen);
         sha512_update(&in, idx, 4);
         u8 ih[64]; sha512_final(&in, ih);
-        sha512_ctx ou = h.outer;
-        sha512_update(&ou, ih, 64);
-        sha512_final(&ou, u);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            u64 v = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) v = (v << 8) | ih[i*8 + j];
+            st[i] = v;
+        }
     }
-    for (int i = 0; i < 64; i++) out[i] = u[i];
+    // outer half of U1: message is the 64-byte inner digest.
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = st[i];
+    w[8] = 0x8000000000000000ULL;
+    #pragma unroll
+    for (int i = 9; i < 15; i++) w[i] = 0;
+    w[15] = (u64)(128 + 64) * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) u[i] = outer[i];
+    sha512_block(u, w);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = u[i];
 
-    // Inner loop: use fixed-64-byte optimized HMAC to skip branching overhead.
-    // hmac512_compute_64 assumes msg is always exactly 64 bytes, which is true
-    // for all iterations after U1 (each U[i] is the 64-byte output of the previous).
+    // ---- iterations 2..c: two fixed-layout compressions, all in registers ----
     for (u32 iter = 1; iter < iters; iter++) {
-        u8 t[64];
-        hmac512_compute_64(&h, u, t);
-        for (int i = 0; i < 64; i++) { out[i] ^= t[i]; u[i] = t[i]; }
+        u64 s[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { s[i] = inner[i]; w[i] = u[i]; }
+        w[8] = 0x8000000000000000ULL;
+        #pragma unroll
+        for (int i = 9; i < 15; i++) w[i] = 0;
+        w[15] = (u64)(128 + 64) * 8;
+        sha512_block(s, w);
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { u[i] = outer[i]; w[i] = s[i]; }
+        w[8] = 0x8000000000000000ULL;
+        #pragma unroll
+        for (int i = 9; i < 15; i++) w[i] = 0;
+        w[15] = (u64)(128 + 64) * 8;
+        sha512_block(u, w);
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) acc[i] ^= u[i];
     }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) out[i*8 + j] = (u8)(acc[i] >> (56 - j*8));
 }
 
 // ===========================================================================
@@ -567,22 +738,32 @@ __device__ void fe_mul(fe* r, const fe* a, const fe* b) {
 
 __device__ __forceinline__ void fe_sqr(fe* r, const fe* a) { fe_mul(r, a, a); }
 
-// modular inverse via Fermat: a^(p-2) mod p. p-2 little-endian limbs:
+// Modular inverse a^(p-2) mod p via the libsecp256k1 addition chain: 255
+// squarings + 15 multiplications, versus ~256 + ~250 for a plain square-and-
+// multiply over the bits of p-2. The binary expansion of p-2 is 5 runs of 1s
+// with lengths in {1, 2, 22, 223}, so the chain builds 2^n-1 for
+// n = 1,2,3,6,9,11,22,44,88,176,220,223 and assembles the result from those.
+#define FE_SQR_N(dst, src, n) do { dst = (src); for (int _i = 0; _i < (n); _i++) fe_sqr(&dst, &dst); } while (0)
+
 __device__ void fe_inv(fe* r, const fe* a) {
-    // exponent = p - 2 = 0xFFFF...FFFFFFFEFFFFFC2D (lo limb), rest 0xFFFF...
-    const u64 e[4] = {0xFFFFFFFEFFFFFC2DULL, 0xFFFFFFFFFFFFFFFFULL,
-                      0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
-    fe result; fe_one(&result);
-    fe base = *a;
-    for (int limb = 0; limb < 4; limb++) {
-        u64 w = e[limb];
-        int bits = (limb == 3) ? 64 : 64; // process all 64 bits each limb
-        for (int b = 0; b < bits; b++) {
-            if ((w >> b) & 1) fe_mul(&result, &result, &base);
-            fe_sqr(&base, &base);
-        }
-    }
-    *r = result;
+    fe x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t;
+
+    fe_sqr(&x2, a);        fe_mul(&x2, &x2, a);       // a^(2^2-1)
+    fe_sqr(&x3, &x2);      fe_mul(&x3, &x3, a);       // a^(2^3-1)
+    FE_SQR_N(x6,   x3,   3);   fe_mul(&x6,   &x6,   &x3);
+    FE_SQR_N(x9,   x6,   3);   fe_mul(&x9,   &x9,   &x3);
+    FE_SQR_N(x11,  x9,   2);   fe_mul(&x11,  &x11,  &x2);
+    FE_SQR_N(x22,  x11, 11);   fe_mul(&x22,  &x22,  &x11);
+    FE_SQR_N(x44,  x22, 22);   fe_mul(&x44,  &x44,  &x22);
+    FE_SQR_N(x88,  x44, 44);   fe_mul(&x88,  &x88,  &x44);
+    FE_SQR_N(x176, x88, 88);   fe_mul(&x176, &x176, &x88);
+    FE_SQR_N(x220, x176, 44);  fe_mul(&x220, &x220, &x44);
+    FE_SQR_N(x223, x220, 3);   fe_mul(&x223, &x223, &x3);
+
+    FE_SQR_N(t, x223, 23);  fe_mul(&t, &t, &x22);
+    FE_SQR_N(t, t,     5);  fe_mul(&t, &t, a);
+    FE_SQR_N(t, t,     3);  fe_mul(&t, &t, &x2);
+    FE_SQR_N(t, t,     2);  fe_mul(r, &t, a);
 }
 
 // ---- point operations (Jacobian) ----
@@ -654,14 +835,66 @@ __device__ void be32_to_limbs(const u8* b, u64 out[4]) {
     }
 }
 
-// R = k*G, k given as little-endian limbs (k must be in [1, n-1]).
-__device__ void scalar_mul_G(jpoint* r, const u64 k[4]) {
+// Reference R = k*G by plain double-and-add. Only used to build the window
+// table below (once per process), so its cost does not matter; keeping it means
+// the table is generated by the same code path the selftest already validates.
+__device__ void scalar_mul_G_ref(jpoint* r, const u64 k[4]) {
     jpoint acc; jp_set_infinity(&acc);
     fe gx, gy; fe_set(&gx, GX); fe_set(&gy, GY);
     for (int limb = 3; limb >= 0; limb--) {
         for (int b = 63; b >= 0; b--) {
             jp_double(&acc, &acc);
             if ((k[limb] >> b) & 1) jp_add_affine(&acc, &acc, &gx, &gy);
+        }
+    }
+    *r = acc;
+}
+
+// ---- fixed-base window table ----
+//
+// Every scalar multiplication in this program is against the fixed generator G
+// (BIP32 CKD-priv for the two non-hardened levels, plus the final pubkey), so
+// the multiples of G can be precomputed. With 4-bit windows,
+//     k*G = sum over w of digit_w * 16^w * G,   digit_w in 0..15
+// which is 64 point additions and *no* doublings, against 256 doublings + ~128
+// additions for double-and-add. G_TABLE[w][j] holds (j+1) * 16^w * G in affine
+// form; 64*15*64 B = 60 KiB, small enough to stay resident in L2.
+typedef struct { fe x, y; } apoint;
+__device__ apoint G_TABLE[64][15];
+
+// One thread per table entry. Must be launched once (with >= 960 threads)
+// before any kernel that derives a public key; src/gpu.rs does this at startup.
+extern "C" __global__ void k_init_gtable() {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= 64 * 15) return;
+    u32 w = t / 15, j = t % 15;
+
+    // scalar = (j+1) << (4*w)
+    u64 k[4] = {0, 0, 0, 0};
+    u32 shift = 4 * w, limb = shift >> 6, off = shift & 63;
+    u64 v = (u64)(j + 1);
+    k[limb] = v << off;
+    if (off && limb < 3) k[limb + 1] = v >> (64 - off);
+
+    jpoint p; scalar_mul_G_ref(&p, k);
+    fe zinv, z2, z3;
+    fe_inv(&zinv, &p.Z);
+    fe_sqr(&z2, &zinv);
+    fe_mul(&z3, &z2, &zinv);
+    fe_mul(&G_TABLE[w][j].x, &p.X, &z2);
+    fe_mul(&G_TABLE[w][j].y, &p.Y, &z3);
+}
+
+// R = k*G, k given as little-endian limbs (k must be in [1, n-1]).
+__device__ void scalar_mul_G(jpoint* r, const u64 k[4]) {
+    jpoint acc; jp_set_infinity(&acc);
+    #pragma unroll 1
+    for (int w = 0; w < 64; w++) {
+        u32 d = (u32)((k[w >> 4] >> ((w & 15) * 4)) & 15);
+        if (d) {
+            const apoint* q = &G_TABLE[w][d - 1];
+            fe qx = q->x, qy = q->y;
+            jp_add_affine(&acc, &acc, &qx, &qy);
         }
     }
     *r = acc;
@@ -732,26 +965,6 @@ __device__ void bip32_ckd_priv(u8 key[32], u8 cc[32], u32 index) {
     for (int i = 0; i < 32; i++) cc[i] = I[32 + i];
 }
 
-// seed[64] -> raw 32-byte private key at m/44'/0'/0'/0/0.
-// Stops before pubkey derivation. Used by k_pipeline_pubkey to skip
-// the SHA256+RIPEMD160 step and compare the pubkey directly instead.
-// __noinline__ required — see the note on pbkdf2_hmac_sha512_64.
-__device__ __noinline__ void seed_to_privkey(const u8 seed[64], u8 privkey[32]) {
-    u8 I[64];
-    hmac_sha512((const u8*)"Bitcoin seed", 12, seed, 64, I);
-    u8 key[32], cc[32];
-    for (int i = 0; i < 32; i++) { key[i] = I[i]; cc[i] = I[32 + i]; }
-
-    const u32 H = 0x80000000u;
-    bip32_ckd_priv(key, cc, H + 44);
-    bip32_ckd_priv(key, cc, H +  0);
-    bip32_ckd_priv(key, cc, H +  0);
-    bip32_ckd_priv(key, cc,      0);
-    bip32_ckd_priv(key, cc,      0);
-
-    for (int i = 0; i < 32; i++) privkey[i] = key[i];
-}
-
 // seed[64] -> P2PKH hash160[20] for m/44'/0'/0'/0/0.
 // __noinline__ required — see the note on pbkdf2_hmac_sha512_64.
 __device__ __noinline__ void seed_to_hash160(const u8 seed[64], u8 hash160[20]) {
@@ -771,6 +984,44 @@ __device__ __noinline__ void seed_to_hash160(const u8 seed[64], u8 hash160[20]) 
     u8 pub[33]; pubkey_compressed(k, pub);
     u8 sha[32]; sha256(pub, 33, sha);
     ripemd160(sha, 32, hash160);
+}
+
+// Serialize k*G as the 64-byte uncompressed X||Y (each big-endian). Only used
+// for ETH address derivation — Keccak256(X||Y)[12:32].
+__device__ void pubkey_xy(const u64 k[4], u8 out[64]) {
+    jpoint p; scalar_mul_G(&p, k);
+    fe zinv, zinv2, zinv3, x, y;
+    fe_inv(&zinv, &p.Z);
+    fe_sqr(&zinv2, &zinv);
+    fe_mul(&zinv3, &zinv2, &zinv);
+    fe_mul(&x, &p.X, &zinv2);
+    fe_mul(&y, &p.Y, &zinv3);
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++) {
+            out[i*8+j]    = (u8)(x.n[3-i] >> (56 - j*8));
+            out[32+i*8+j] = (u8)(y.n[3-i] >> (56 - j*8));
+        }
+}
+
+// seed[64] -> ETH address[20] for m/44'/60'/0'/0/0.
+// __noinline__ required — see the note on pbkdf2_hmac_sha512_64.
+__device__ __noinline__ void seed_to_eth_address(const u8 seed[64], u8 addr[20]) {
+    u8 I[64];
+    hmac_sha512((const u8*)"Bitcoin seed", 12, seed, 64, I); // fixed per BIP32, not coin-specific
+    u8 key[32], cc[32];
+    for (int i = 0; i < 32; i++) { key[i] = I[i]; cc[i] = I[32 + i]; }
+
+    const u32 H = 0x80000000u;
+    bip32_ckd_priv(key, cc, H + 44);
+    bip32_ckd_priv(key, cc, H + 60);
+    bip32_ckd_priv(key, cc, H + 0);
+    bip32_ckd_priv(key, cc, 0);
+    bip32_ckd_priv(key, cc, 0);
+
+    u64 k[4]; be32_to_limbs(key, k);
+    u8 xy[64]; pubkey_xy(k, xy);
+    u8 hash[32]; keccak256(xy, 64, hash);
+    for (int i = 0; i < 20; i++) addr[i] = hash[12 + i];
 }
 
 // ===========================================================================
@@ -852,25 +1103,13 @@ void k_pipeline(const unsigned short* cand, const u32* survivors, u32 count,
     }
 }
 
-// ===========================================================================
-// Pubkey pipeline: same flow as k_pipeline but stops at the compressed public
-// key and compares 33 bytes against target_pubkey instead of computing
-// SHA256(pubkey) + RIPEMD160. Saves ~2 hash rounds per surviving candidate.
-//
-// Pass 1 (k_filter) is shared — BIP-39 checksum is always checked first.
-// ===========================================================================
+// Same as k_pipeline, but derives m/44'/60'/0'/0/0 and compares against a
+// 20-byte ETH address (Keccak256(X||Y)[12:]) instead of BTC's hash160.
 extern "C" __global__
-void k_pipeline_pubkey(
-        const unsigned short* cand,    // flat [N×12] word-index array
-        const u32*            survivors, // compacted survivor indices from k_filter
-        u32                   count,     // number of survivors
-        const u8*             wordlist,
-        const u8*             word_lens,
-        u32                   word_stride,
-        const u8*             target_pubkey, // 33 bytes: compressed pubkey to match
-        unsigned int*         found_flag,
-        unsigned int*         found_idx)
-{
+void k_pipeline_eth(const unsigned short* cand, const u32* survivors, u32 count,
+                const u8* wordlist, const u8* word_lens, u32 word_stride,
+                const u8* target_addr,
+                unsigned int* found_flag, unsigned int* found_idx) {
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= count) return;
     if (*found_flag) return;
@@ -878,33 +1117,25 @@ void k_pipeline_pubkey(
     u32 i = survivors[t];
     const unsigned short* idx = cand + (u64)i * 12;
 
-    // Build the NFKD mnemonic string (same as k_pipeline).
     u8 msg[MNEMONIC_BUF];
     u32 mlen = 0;
     for (int w = 0; w < 12; w++) {
         u32 wi = idx[w];
-        u8 wl  = word_lens[wi];
+        u8 wl = word_lens[wi];
         const u8* wp = wordlist + (u64)wi * word_stride;
         for (u32 c = 0; c < wl; c++) msg[mlen++] = wp[c];
         if (w < 11) msg[mlen++] = ' ';
     }
 
-    // BIP-39 seed via PBKDF2-HMAC-SHA512 (2048 iterations, no passphrase).
     u8 seed[64];
     const u8 salt[8] = {'m','n','e','m','o','n','i','c'};
     pbkdf2_hmac_sha512_64(msg, mlen, salt, 8, 2048, seed);
 
-    // BIP32 m/44'/0'/0'/0/0 -> private key (stops before hash160).
-    u8 privkey[32];
-    seed_to_privkey(seed, privkey);
+    u8 addr[20];
+    seed_to_eth_address(seed, addr);
 
-    // Derive the compressed 33-byte public key.
-    u64 k[4]; be32_to_limbs(privkey, k);
-    u8 pub[33]; pubkey_compressed(k, pub);
-
-    // Compare 33-byte compressed pubkey against target.
     int eq = 1;
-    for (int j = 0; j < 33; j++) if (pub[j] != target_pubkey[j]) { eq = 0; break; }
+    for (int j = 0; j < 20; j++) if (addr[j] != target_addr[j]) { eq = 0; break; }
     if (eq) {
         if (atomicCAS(found_flag, 0u, 1u) == 0u) *found_idx = i;
     }
@@ -933,6 +1164,13 @@ void k_ripemd160(const u8* msgs, const u32* lens, u32 stride, u8* out, u32 n) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     ripemd160(msgs + (u64)i*stride, lens[i], out + (u64)i*20);
+}
+
+extern "C" __global__
+void k_keccak256(const u8* msgs, const u32* lens, u32 stride, u8* out, u32 n) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    keccak256(msgs + (u64)i*stride, lens[i], out + (u64)i*32);
 }
 
 extern "C" __global__
@@ -984,6 +1222,14 @@ void k_seed_to_hash160(const u8* seeds, u8* out, u32 n) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     seed_to_hash160(seeds + (u64)i*64, out + (u64)i*20);
+}
+
+// One 64-byte seed in -> 20-byte ETH address (m/44'/60'/0'/0/0) out.
+extern "C" __global__
+void k_seed_to_eth_address(const u8* seeds, u8* out, u32 n) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    seed_to_eth_address(seeds + (u64)i*64, out + (u64)i*20);
 }
 
 // a^{-1} mod p, 32-byte big-endian. Debug helper.
