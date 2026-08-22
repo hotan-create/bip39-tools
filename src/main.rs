@@ -2,17 +2,19 @@ use anyhow::{Context, Result};
 use bip39::{Language, Mnemonic};
 use bitcoin::address::{Address, NetworkChecked, NetworkUnchecked};
 use bitcoin::bip32::{DerivationPath, Xpriv};
-use bitcoin::secp256k1::{PublicKey as Secp256k1PubKey, Secp256k1};
+use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
+use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
+use sha3::{Digest, Keccak256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod candidates;
 mod gpu;
@@ -23,54 +25,62 @@ mod gpu;
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Try permutations of BIP-39 words / token slots to match a BTC legacy address.",
+    about = "BIP-39 mnemonic recovery — word mode or tokenlist mode.\n\
+             Word mode   : supply 10-12 known words as positional args.\n\
+             Tokenlist   : supply --tokenlist <file> (see --help for format).",
     version
 )]
 struct Args {
-    /// Target legacy Bitcoin address (Base58, starts with '1').
-    /// Exactly one of --target-address (positional) or --target-pubkey must be given.
+    /// Target Bitcoin legacy address (Base58, starts with '1').
     target_address: Option<String>,
 
-    /// Target compressed or uncompressed public key (hex).
-    /// Compressed: 66 hex chars (33 bytes, prefix 02 or 03).
-    /// Uncompressed: 130 hex chars (65 bytes, prefix 04) — auto-converted to compressed.
-    /// Using a pubkey target skips the final SHA256+RIPEMD160 hash step on the GPU,
-    /// making each check slightly faster.
-    #[arg(long, value_name = "HEX")]
-    target_pubkey: Option<String>,
+    /// Known words (word mode only). 10, 11, or 12 words.
+    /// Omit when using --tokenlist.
+    words: Vec<String>,
 
-    /// BIP-39 wordlist language
-    #[arg(long, short, default_value = "english")]
-    language: String,
-
-    /// Path to a tokenlist file.
+    /// Path to tokenlist file (tokenlist mode).
     ///
-    /// FILE FORMAT
-    /// ===========
-    /// • One line = one SLOT (= one token).
-    /// • Blank lines and lines starting with '#' are ignored.
-    /// • Within a line, ALTERNATIVES are separated by whitespace.
-    /// • Within an alternative, WORDS are separated by commas.
-    /// • A bare '?' inside an alternative marks a MISSING word to brute-force.
+    /// FORMAT
+    /// ======
+    /// • One line = one SLOT (positional group of words).
+    /// • Blank lines and '#' comments are ignored.
+    /// • Alternatives within a line separated by whitespace.
+    /// • Words within an alternative separated by commas.
+    /// • '?' = unknown word, brute-forced from full BIP-39 list.
     ///
     /// EXAMPLE
-    ///   zebra,liquid,tornado,?   abandon,art   <- slot 1
+    ///   zebra,liquid,tornado,?   abandon,art   <- slot 1 (2 alternatives)
     ///   orbit,galaxy                           <- slot 2
     ///   venture,sun                            <- slot 3
+    ///
+    /// Total words across chosen slots must equal 12.
     #[arg(long, value_name = "FILE")]
     tokenlist: Option<PathBuf>,
 
-    /// Keep SLOT order as written in the file (do not permute slots).
+    /// Keep slot order as written (no slot permutations).
     #[arg(long)]
     keep_token_order: bool,
 
-    /// Keep WORD order within each slot as written.
+    /// Keep word order within each slot (no intra-slot permutations).
     #[arg(long)]
     keep_word_order: bool,
 
-    /// Minimum number of slots to use (default: all slots).
+    /// Minimum number of slots to use (default: all).
     #[arg(long, value_name = "N")]
     min_token: Option<usize>,
+
+    /// BIP-39 wordlist language.
+    #[arg(long, short, default_value = "english")]
+    language: String,
+
+    /// Target coin: btc (P2PKH, default) or eth.
+    #[arg(long, default_value = "btc")]
+    coin: String,
+
+    /// Override BIP-32 derivation path.
+    /// Defaults: m/44'/0'/0'/0/0 (btc), m/44'/60'/0'/0/0 (eth).
+    #[arg(long, value_name = "PATH")]
+    derivation_path: Option<String>,
 
     /// Number of CPU threads (0 = all cores).
     #[arg(long, short, default_value_t = 0)]
@@ -84,27 +94,22 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
-    /// Override GPU batch size exactly (default: auto-probe).
-    /// Example: --batch-size 65536
+    /// Override GPU batch size exactly.
     #[arg(long, value_name = "N")]
     batch_size: Option<usize>,
 
-    /// Probe START: batch size = 2^EXP (default: 16 = 65 536).
-    /// Probe begins here and doubles until --max-batch or memory error.
-    /// Example: --min-batch 16
+    /// Probe START: batch = 2^EXP (default 16 = 65 536).
     #[arg(long, value_name = "EXP", default_value_t = 16)]
     min_batch: u32,
 
-    /// Probe CAP: batch size never exceeds 2^EXP (default: 28 = 268M).
-    /// Set to 16 to cap at 65 536 — safe for 2 GB VRAM.
-    /// Example: --max-batch 16
+    /// Probe CAP: batch never exceeds 2^EXP (default 28 = 268M).
+    /// Use --max-batch 16 for 2 GB VRAM, --max-batch 17 for 4 GB, etc.
     #[arg(long, value_name = "EXP", default_value_t = 28)]
     max_batch: u32,
 }
 
-
 // ---------------------------------------------------------------------------
-// Data model
+// Tokenlist data model
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -114,7 +119,125 @@ enum Token {
 }
 
 type Alternative = Vec<Token>;
-type Slot = Vec<Alternative>;
+type Slot        = Vec<Alternative>;
+
+// ---------------------------------------------------------------------------
+// Coin / Target
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coin {
+    Btc,
+    Eth,
+}
+
+fn parse_coin(s: &str) -> Result<Coin> {
+    match s.to_lowercase().as_str() {
+        "btc" | "bitcoin"  => Ok(Coin::Btc),
+        "eth" | "ethereum" => Ok(Coin::Eth),
+        _ => anyhow::bail!("Unknown coin '{s}' (expected 'btc' or 'eth')"),
+    }
+}
+
+fn default_derivation_path(coin: Coin) -> &'static str {
+    match coin {
+        Coin::Btc => "m/44'/0'/0'/0/0",
+        Coin::Eth => "m/44'/60'/0'/0/0",
+    }
+}
+
+/// Parsed recovery target: a Bitcoin address or a normalized (lowercase,
+/// 0x-prefixed) Ethereum address string.
+#[derive(Debug, Clone)]
+enum Target {
+    Btc(Address<NetworkChecked>),
+    Eth(String),
+}
+
+impl Target {
+    fn as_display_string(&self) -> String {
+        match self {
+            Target::Btc(a) => a.to_string(),
+            Target::Eth(s) => eth_checksum_address(s),
+        }
+    }
+
+    /// Lowercase comparison string (checksum-insensitive).
+    fn as_compare_string(&self) -> String {
+        match self {
+            Target::Btc(a) => a.to_string(),
+            Target::Eth(s) => s.clone(),
+        }
+    }
+
+}
+
+/// The 20-byte value candidates are compared against: hash160 for BTC,
+/// the raw ETH address bytes for ETH.
+fn target_hash20(target: &Target) -> Result<[u8; 20]> {
+    match target {
+        Target::Btc(a) => p2pkh_hash160(a),
+        Target::Eth(s) => {
+            let body = &s[2..]; // strip "0x"
+            let mut out = [0u8; 20];
+            for i in 0..20 {
+                out[i] = u8::from_str_radix(&body[i*2..i*2+2], 16)
+                    .with_context(|| format!("invalid ETH address hex: {s}"))?;
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// GPU pipeline kernel name for a coin (see kernels.cu).
+fn pipeline_kernel(coin: Coin) -> &'static str {
+    match coin {
+        Coin::Btc => "k_pipeline",
+        Coin::Eth => "k_pipeline_eth",
+    }
+}
+
+/// Normalize a user-supplied ETH address to lowercase "0x" + 40 hex chars.
+/// Accepts either checksummed or all-lowercase/uppercase input.
+fn normalize_eth_address(s: &str) -> Result<String> {
+    let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    anyhow::ensure!(body.len() == 40, "Invalid ETH address (expected 40 hex chars): {s}");
+    anyhow::ensure!(body.chars().all(|c| c.is_ascii_hexdigit()), "Invalid ETH address (non-hex chars): {s}");
+    Ok(format!("0x{}", body.to_lowercase()))
+}
+
+/// Apply EIP-55 mixed-case checksum to a lowercase "0x..." address, for display only.
+fn eth_checksum_address(lower: &str) -> String {
+    let body = &lower[2..];
+    let hash = Keccak256::digest(body.as_bytes());
+    let mut out = String::with_capacity(42);
+    out.push_str("0x");
+    for (i, c) in body.chars().enumerate() {
+        if c.is_ascii_digit() {
+            out.push(c);
+            continue;
+        }
+        let byte = hash[i / 2];
+        let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+        if nibble >= 8 { out.push(c.to_ascii_uppercase()); } else { out.push(c); }
+    }
+    out
+}
+
+/// Derive the lowercase "0x..." ETH address from a child private key.
+fn eth_address_from_privkey(secret: &SecretKey, secp: &Secp256k1<bitcoin::secp256k1::All>) -> String {
+    let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(secp, secret);
+    let uncompressed = pubkey.serialize_uncompressed(); // [0x04, X(32), Y(32)] = 65 bytes
+    let hash = Keccak256::digest(&uncompressed[1..]);    // hash the 64-byte X||Y
+    let addr_bytes = &hash[12..]; // last 20 bytes
+    format!("0x{}", hex_lower(addr_bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes { s.push_str(&format!("{:02x}", b)); }
+    s
+}
 
 // ---------------------------------------------------------------------------
 // main
@@ -126,147 +249,132 @@ fn main() -> Result<()> {
     if args.selftest {
         println!("Running GPU primitive selftests...");
         let ok = gpu::run_selftest()?;
-        if ok {
-            println!("All selftests passed.");
-            // WSL2: skip cuCtxDestroy crash
-            std::process::exit(0);
-        } else {
-            eprintln!("One or more selftests FAILED");
-            std::process::exit(1);
-        }
+        if ok { println!("All selftests passed."); std::process::exit(0); }
+        else  { eprintln!("One or more selftests FAILED"); std::process::exit(1); }
     }
 
-    // ── Resolve target: exactly one of --target-address or --target-pubkey ──
-    let target_mode: TargetMode = match (&args.target_address, &args.target_pubkey) {
-        (Some(addr_str), None) => {
-            let target: Address<NetworkChecked> = addr_str
-                .parse::<Address<NetworkUnchecked>>()
-                .context("Invalid Bitcoin address")?
+    let coin = parse_coin(&args.coin)?;
+    let target_str = args.target_address.as_deref().context("Missing target address")?;
+    let target: Target = match coin {
+        Coin::Btc => {
+            let addr: Address<NetworkChecked> = target_str
+                .parse::<Address<NetworkUnchecked>>().context("Invalid Bitcoin address")?
                 .require_network(Network::Bitcoin.into())
-                .context("Only mainnet legacy addresses are supported")?;
-            let h160 = p2pkh_hash160(&target)?;
-            println!("Target: address {} (hash160 mode)", addr_str);
-            TargetMode::Hash160(h160)
+                .context("Only mainnet legacy addresses supported")?;
+            Target::Btc(addr)
         }
-        (None, Some(pk_hex)) => {
-            let pubkey = parse_pubkey_hex(pk_hex)?;
-            println!(
-                "Target: pubkey {} (pubkey mode — skips SHA256+RIPEMD160, faster)",
-                &pk_hex[..pk_hex.trim().len().min(20)]
-            );
-            TargetMode::Pubkey(pubkey)
-        }
-        (Some(_), Some(_)) => anyhow::bail!(
-            "Specify either a positional address OR --target-pubkey, not both."
-        ),
-        (None, None) => anyhow::bail!(
-            "Missing target: provide a legacy Bitcoin address (positional) or --target-pubkey <HEX>."
-        ),
+        Coin::Eth => Target::Eth(normalize_eth_address(target_str)?),
     };
 
+    let deriv_path_str = args.derivation_path.clone().unwrap_or_else(|| default_derivation_path(coin).to_string());
+    let deriv: DerivationPath = deriv_path_str.parse().context("Invalid derivation path")?;
+    // The CUDA kernels only implement each coin's fixed default path; a
+    // custom --derivation-path can only run on CPU.
+    let custom_path = args.derivation_path.is_some() && deriv_path_str != default_derivation_path(coin);
+
     let language = parse_language(&args.language)?;
-    let start = Instant::now();
+    let wall     = Instant::now();
 
-    let tokenlist_path = args
-        .tokenlist
-        .as_ref()
-        .context("--tokenlist is required")?;
+    let force_cpu = args.cpu || custom_path;
+    if custom_path && !args.cpu {
+        println!("Custom --derivation-path: GPU kernels only support each coin's default path, using CPU.");
+    }
 
-    let slots = parse_tokenlist(tokenlist_path)?;
-    validate_slots(&slots, language)?;
+    let found = if args.tokenlist.is_some() {
+        // ── tokenlist mode ──────────────────────────────────────────────────
+        let path  = args.tokenlist.as_ref().unwrap();
+        let slots = parse_tokenlist(path)?;
+        validate_slots(&slots, language)?;
 
-    let found = if args.cpu {
-        println!("--cpu flag set: using CPU.");
-        run_search_cpu(&args, &slots, &target_mode, language)?
+        if force_cpu {
+            if !custom_path { println!("--cpu: using CPU (tokenlist mode)."); }
+            run_tokenlist_cpu(&args, &slots, &target, language, coin, &deriv)?
+        } else {
+            match run_tokenlist_gpu(&args, &slots, &target, language, coin) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("GPU unavailable ({e:#}); falling back to CPU.");
+                    run_tokenlist_cpu(&args, &slots, &target, language, coin, &deriv)?
+                }
+            }
+        }
     } else {
-        match run_search_gpu(&args, &slots, &target_mode, language) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("GPU unavailable ({e:#}); falling back to CPU.");
-                run_search_cpu(&args, &slots, &target_mode, language)?
+        // ── word mode ───────────────────────────────────────────────────────
+        if !(10..=12).contains(&args.words.len()) {
+            anyhow::bail!("Word mode: expected 10–12 words, got {}. Use --tokenlist for slot-based search.", args.words.len());
+        }
+        if force_cpu {
+            run_word_cpu(&args, &target, language, coin, &deriv)?
+        } else {
+            match run_word_gpu(&args, &target, language, coin) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("GPU unavailable ({e:#}); falling back to CPU.");
+                    run_word_cpu(&args, &target, language, coin, &deriv)?
+                }
             }
         }
     };
 
-    
-    let elapsed = start.elapsed();
     if !found {
-        let mode_label = match &target_mode {
-            TargetMode::Hash160(_) => "address/hash160",
-            TargetMode::Pubkey(_)  => "pubkey33 (no hash)",
-        };
         println!(
-            "Exhausted all candidates without a match.\n  Mode   : {}\n  Elapsed: {:.3}s",
-            mode_label,
-            elapsed.as_secs_f64(),
+            "\nNo match found.  Elapsed: {:.3}s",
+            wall.elapsed().as_secs_f64()
         );
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tokenlist parsing
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// TOKENLIST PARSING
+// ===========================================================================
 
 fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Cannot read tokenlist: {}", path.display()))?;
 
     let mut slots: Vec<Slot> = Vec::new();
-
     for (lineno, raw) in content.lines().enumerate() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+        if line.is_empty() || line.starts_with('#') { continue; }
 
         let alternatives: Vec<Alternative> = line
             .split_whitespace()
             .map(|alt_str| {
-                alt_str
-                    .split(',')
+                alt_str.split(',')
                     .filter(|t| !t.is_empty())
-                    .map(|t| {
-                        let t = t.trim();
-                        if t == "?" {
-                            Token::Missing
-                        } else {
-                            Token::Word(t.to_string())
-                        }
+                    .map(|t| if t.trim() == "?" {
+                        Token::Missing
+                    } else {
+                        Token::Word(t.trim().to_string())
                     })
                     .collect::<Alternative>()
             })
-            .filter(|alt| !alt.is_empty())
+            .filter(|a| !a.is_empty())
             .collect();
 
         if alternatives.is_empty() {
             eprintln!("Warning: line {} empty after parsing, skipping.", lineno + 1);
             continue;
         }
-
         slots.push(alternatives);
     }
 
-    if slots.is_empty() {
-        anyhow::bail!("Tokenlist is empty or has no valid lines");
-    }
-
+    anyhow::ensure!(!slots.is_empty(), "Tokenlist is empty or has no valid lines");
     println!("Loaded {} slot(s) from tokenlist.", slots.len());
     Ok(slots)
 }
 
 fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
-    let wordlist: &'static [&'static str] = language.words_by_prefix("");
+    let wl: &'static [&'static str] = language.words_by_prefix("");
     for (si, slot) in slots.iter().enumerate() {
         for (ai, alt) in slot.iter().enumerate() {
-            for token in alt {
-                if let Token::Word(w) = token {
-                    if !wordlist.contains(&w.as_str()) {
-                        anyhow::bail!(
-                            "Slot {}, alternative {}: '{}' is not in the BIP-39 wordlist",
-                            si + 1, ai + 1, w
-                        );
-                    }
+            for tok in alt {
+                if let Token::Word(w) = tok {
+                    anyhow::ensure!(
+                        wl.contains(&w.as_str()),
+                        "Slot {}, alt {}: '{}' not in BIP-39 wordlist", si+1, ai+1, w
+                    );
                 }
             }
         }
@@ -275,119 +383,101 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Token / alternative expansion helpers
+// Expand one alternative → (known_word_indices, missing_positions)
 // ---------------------------------------------------------------------------
 
-fn expand_alternative(alt: &Alternative) -> (Vec<String>, Vec<usize>) {
-    let mut words: Vec<String> = Vec::new();
-    let mut missing_positions: Vec<usize> = Vec::new();
-    for (i, token) in alt.iter().enumerate() {
-        match token {
-            Token::Word(w) => words.push(w.clone()),
-            Token::Missing => missing_positions.push(i),
+fn expand_alternative(
+    alt: &Alternative,
+    wordlist: &'static [&'static str],
+) -> (Vec<u16>, Vec<usize>) {
+    let mut known: Vec<u16>   = Vec::new();
+    let mut miss:  Vec<usize> = Vec::new();
+    for (i, tok) in alt.iter().enumerate() {
+        match tok {
+            Token::Word(w) => known.push(wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16),
+            Token::Missing => miss.push(i),
         }
     }
-    (words, missing_positions)
+    (known, miss)
 }
+
+// ---------------------------------------------------------------------------
+// slot_candidates: expand one alternative into Vec<Vec<u16>> of partial phrases
+// ---------------------------------------------------------------------------
 
 fn slot_candidates(
-    known_indices: &[u16],
-    missing_positions: &[usize],
+    known: &[u16],
+    miss:  &[usize],
     total_len: usize,
     keep_word_order: bool,
-    wordlist_len: usize,
+    wl_len: usize,
 ) -> Vec<Vec<u16>> {
-    let missing_count = missing_positions.len();
-
-    let known_perms: Box<dyn Iterator<Item = Vec<u16>>> = if keep_word_order {
-        Box::new(std::iter::once(known_indices.to_vec()))
+    let known_perms: Vec<Vec<u16>> = if keep_word_order {
+        vec![known.to_vec()]
     } else {
-        let n = known_indices.len();
-        Box::new(known_indices.iter().copied().permutations(n))
+        known.iter().copied().permutations(known.len()).collect()
     };
 
-    let mut results: Vec<Vec<u16>> = Vec::new();
-
-    for known_perm in known_perms {
-        for missing_values in (0..wordlist_len as u16).permutations_with_replacement(missing_count) {
-            let mut seq: Vec<u16> = Vec::with_capacity(total_len);
-            let mut ki = 0usize;
-            let mut mi = 0usize;
+    let mut out = Vec::new();
+    for kp in &known_perms {
+        for mv in missing_combos(wl_len as u16, miss.len()) {
+            let mut seq = Vec::with_capacity(total_len);
+            let (mut ki, mut mi) = (0, 0);
             for pos in 0..total_len {
-                if missing_positions.contains(&pos) {
-                    seq.push(missing_values[mi]);
-                    mi += 1;
-                } else {
-                    seq.push(known_perm[ki]);
-                    ki += 1;
-                }
+                if miss.contains(&pos) { seq.push(mv[mi]); mi += 1; }
+                else                   { seq.push(kp[ki]); ki += 1; }
             }
-            results.push(seq);
+            out.push(seq);
         }
     }
+    out
+}
 
-    results
+/// Yield all n^k combinations with replacement (k indices from 0..n).
+fn missing_combos(n: u16, k: usize) -> Vec<Vec<u16>> {
+    if k == 0 { return vec![vec![]]; }
+    let mut result = Vec::new();
+    let sub = missing_combos(n, k - 1);
+    for i in 0..n {
+        for mut s in sub.clone() {
+            s.insert(0, i);
+            result.push(s);
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
-// Lazy phrase iterator — O(1) RAM, streams to GPU without Vec allocation
+// LazyPhraseIter — O(1) RAM, yields [u16;12] one at a time
 // ---------------------------------------------------------------------------
 
-/// Iterates over all 12-word phrase combinations without collecting into a Vec.
-/// This is the key fix for OOM: 1B candidates × 24 bytes = 24 GB if collected.
-/// With LazyPhraseIter, only one [u16;12] lives in memory at a time.
 struct LazyPhraseIter {
-    // [slot_idx][alt_idx][cand_idx] = Vec<u16> (partial phrase for that slot+alt)
-    slot_alts: Vec<Vec<Vec<Vec<u16>>>>,
-    // Current cursor: which alt and which cand within that alt, per slot
-    alt_idx: Vec<usize>,
-    cand_idx: Vec<usize>,
-    // Slot orderings to try (permutations of slot indices, or just one if keep_token_order)
+    /// [slot][alt][cand_idx] = partial Vec<u16>
+    slot_alts:   Vec<Vec<Vec<Vec<u16>>>>,
     slot_orders: Vec<Vec<usize>>,
-    order_pos: usize, // which ordering we're on
-    done: bool,
-    first: bool,
+    order_pos:   usize,
+    alt_idx:     Vec<usize>,
+    cand_idx:    Vec<usize>,
+    first:       bool,
+    done:        bool,
 }
 
 impl LazyPhraseIter {
     fn new(
-        chosen_slots: &[&Slot],
+        chosen: &[&Slot],
         keep_token_order: bool,
-        keep_word_order: bool,
+        keep_word_order:  bool,
         wordlist: &'static [&'static str],
     ) -> Self {
-        let n = chosen_slots.len();
-        let wordlist_len = wordlist.len();
+        let n      = chosen.len();
+        let wl_len = wordlist.len();
 
-        // Pre-expand each slot × alt into concrete partial-phrase Vec<u16>
-        // This is small: at most a few thousand entries per slot
-        let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen_slots
-            .iter()
-            .map(|slot| {
-                slot.iter()
-                    .map(|alt| {
-                        let (known_words, missing_positions) = expand_alternative(alt);
-                        let total_len = alt.len();
-                        let known_indices: Vec<u16> = known_words
-                            .iter()
-                            .map(|w| {
-                                wordlist
-                                    .iter()
-                                    .position(|x| *x == w.as_str())
-                                    .unwrap() as u16
-                            })
-                            .collect();
-                        slot_candidates(
-                            &known_indices,
-                            &missing_positions,
-                            total_len,
-                            keep_word_order,
-                            wordlist_len,
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+        let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen.iter().map(|slot| {
+            slot.iter().map(|alt| {
+                let (known, miss) = expand_alternative(alt, wordlist);
+                slot_candidates(&known, &miss, alt.len(), keep_word_order, wl_len)
+            }).collect()
+        }).collect();
 
         let slot_orders: Vec<Vec<usize>> = if keep_token_order || n <= 1 {
             vec![(0..n).collect()]
@@ -395,60 +485,44 @@ impl LazyPhraseIter {
             (0..n).permutations(n).collect()
         };
 
-        let num_slots = slot_alts.len();
+        let num = slot_alts.len();
         LazyPhraseIter {
             slot_alts,
-            alt_idx: vec![0; num_slots],
-            cand_idx: vec![0; num_slots],
             slot_orders,
             order_pos: 0,
-            done: num_slots == 0,
+            alt_idx:   vec![0; num],
+            cand_idx:  vec![0; num],
             first: true,
+            done:  num == 0,
         }
     }
 
-    /// Advance cursor for the given slot ordering.
-    /// Returns true if successfully advanced, false if this ordering is exhausted.
-    fn advance_for_order(&mut self, order: &[usize]) -> bool {
+    fn build(&self, order: &[usize]) -> Option<[u16; 12]> {
+        let mut phrase = [0u16; 12];
+        let mut off = 0usize;
+        for &si in order {
+            let words = &self.slot_alts[si][self.alt_idx[si]][self.cand_idx[si]];
+            if off + words.len() > 12 { return None; }
+            phrase[off..off+words.len()].copy_from_slice(words);
+            off += words.len();
+        }
+        if off == 12 { Some(phrase) } else { None }
+    }
+
+    fn advance(&mut self, order: &[usize]) -> bool {
         let n = order.len();
         let mut pos = n as isize - 1;
         while pos >= 0 {
             let si = order[pos as usize];
-            let ai = self.alt_idx[si];
             self.cand_idx[si] += 1;
-            if self.cand_idx[si] < self.slot_alts[si][ai].len() {
-                return true;
-            }
-            // exhausted candidates in this alt — try next alt
+            if self.cand_idx[si] < self.slot_alts[si][self.alt_idx[si]].len() { return true; }
             self.cand_idx[si] = 0;
             self.alt_idx[si] += 1;
-            if self.alt_idx[si] < self.slot_alts[si].len() {
-                return true;
-            }
-            // exhausted alts for this slot — reset and carry
+            if self.alt_idx[si] < self.slot_alts[si].len() { return true; }
             self.alt_idx[si] = 0;
-            self.cand_idx[si] = 0;
             pos -= 1;
         }
         false
-    }
-
-    /// Build the current phrase for the given slot ordering.
-    /// Returns None if the total word count != 12.
-    fn build_phrase(&self, order: &[usize]) -> Option<[u16; 12]> {
-        let mut phrase = [0u16; 12];
-        let mut offset = 0usize;
-        for &si in order {
-            let ai = self.alt_idx[si];
-            let ci = self.cand_idx[si];
-            let words = &self.slot_alts[si][ai][ci];
-            if offset + words.len() > 12 {
-                return None;
-            }
-            phrase[offset..offset + words.len()].copy_from_slice(words);
-            offset += words.len();
-        }
-        if offset == 12 { Some(phrase) } else { None }
     }
 }
 
@@ -456,736 +530,563 @@ impl Iterator for LazyPhraseIter {
     type Item = [u16; 12];
 
     fn next(&mut self) -> Option<[u16; 12]> {
-        if self.done {
-            return None;
-        }
-
+        if self.done { return None; }
         loop {
-            if self.order_pos >= self.slot_orders.len() {
-                self.done = true;
-                return None;
-            }
-
+            if self.order_pos >= self.slot_orders.len() { self.done = true; return None; }
             let order = self.slot_orders[self.order_pos].clone();
 
             if self.first {
                 self.first = false;
-                if let Some(p) = self.build_phrase(&order) {
-                    return Some(p);
-                }
-                // phrase invalid (!=12 words) — fall through to advance
+                if let Some(p) = self.build(&order) { return Some(p); }
             }
 
-            // Try to advance
-            if self.advance_for_order(&order) {
-                if let Some(p) = self.build_phrase(&order) {
-                    return Some(p);
-                }
-                // phrase invalid — keep advancing
+            if self.advance(&order) {
+                if let Some(p) = self.build(&order) { return Some(p); }
                 continue;
             }
 
-            // This ordering exhausted — move to next ordering, reset cursors
+            // this ordering exhausted — next
             self.order_pos += 1;
             self.first = true;
-            for v in self.alt_idx.iter_mut() {
-                *v = 0;
-            }
-            for v in self.cand_idx.iter_mut() {
-                *v = 0;
-            }
+            for v in &mut self.alt_idx  { *v = 0; }
+            for v in &mut self.cand_idx { *v = 0; }
         }
     }
 }
-// ---------------------------------------------------------------------------
-// ProgressIter — wraps LazyPhraseIter, prints throughput every INTERVAL items
-// ---------------------------------------------------------------------------
- 
-struct ProgressIter {
-    inner:     LazyPhraseIter,
-    count:     usize,
-    interval:  usize,
-    start:     Instant,
-    last_tick: Instant,
+
+// ===========================================================================
+// PROGRESS ITERATOR — single overwriting line, seed/s display
+// ===========================================================================
+
+struct ProgressIter<I> {
+    inner:    I,
+    count:    usize,
+    total:    Option<usize>,  // None if unknown
+    interval: usize,
+    start:    Instant,
+    last:     Instant,
 }
- 
-impl ProgressIter {
-    fn new(inner: LazyPhraseIter, interval: usize) -> Self {
+
+impl<I> ProgressIter<I> {
+    fn new(inner: I, total: Option<usize>, interval: usize) -> Self {
         let now = Instant::now();
-        ProgressIter { inner, count: 0, interval, start: now, last_tick: now }
+        ProgressIter { inner, count: 0, total, interval, start: now, last: now }
     }
 }
- 
- 
-impl Iterator for ProgressIter {
+
+impl<I: Iterator<Item = [u16; 12]>> Iterator for ProgressIter<I> {
     type Item = [u16; 12];
- 
+
     fn next(&mut self) -> Option<[u16; 12]> {
         let item = self.inner.next()?;
         self.count += 1;
- 
+
         if self.count % self.interval == 0 {
-            let total_secs = self.start.elapsed().as_secs_f64();
-            let tick_secs  = self.last_tick.elapsed().as_secs_f64();
-            let tp_overall = self.count as f64 / total_secs.max(0.001);
-            let tp_recent  = self.interval as f64 / tick_secs.max(0.001);
- 
-            // \r kembali ke awal baris, overwrite tanpa tambah baris baru.
-            // Spasi di akhir untuk menimpa sisa teks dari print sebelumnya.
+            let total_s  = self.start.elapsed().as_secs_f64();
+            let recent_s = self.last.elapsed().as_secs_f64().max(0.001);
+            let avg_tp   = self.count as f64 / total_s.max(0.001);
+            let rec_tp   = self.interval as f64 / recent_s;
+
+            // Optional ETA
+            let eta_str = match self.total {
+                Some(tot) if tot > self.count => {
+                    let remaining = tot - self.count;
+                    let eta_s = remaining as f64 / avg_tp.max(1.0);
+                    format!(" | ETA {}", fmt_duration(Duration::from_secs_f64(eta_s)))
+                }
+                _ => String::new(),
+            };
+
+            // Progress bar (30 chars wide)
+            let bar_str = match self.total {
+                Some(tot) if tot > 0 => {
+                    let pct   = (self.count as f64 / tot as f64).min(1.0);
+                    let filled = (pct * 30.0) as usize;
+                    let bar: String = (0..30).map(|i| if i < filled { '█' } else { '░' }).collect();
+                    format!(" [{}] {:.1}%", bar, pct * 100.0)
+                }
+                _ => String::new(),
+            };
+
             print!(
-                "\r  {:>10} candidates | {:>7.1}s | {:>8}/s avg | {:>8}/s recent   ",
+                "\r  {:>10} seeds | {:>6.1}s | avg {:>8}/s | recent {:>8}/s{}{}   ",
                 format_number(self.count),
-                total_secs,
-                format_number(tp_overall as usize),
-                format_number(tp_recent  as usize),
+                total_s,
+                format_number(avg_tp as usize),
+                format_number(rec_tp as usize),
+                bar_str,
+                eta_str,
             );
             let _ = io::stdout().flush();
-            self.last_tick = Instant::now();
+            self.last = Instant::now();
         }
- 
         Some(item)
     }
 }
- 
-// ---------------------------------------------------------------------------
-// GPU search — lazy streaming, auto batch size, no OOM
-// ---------------------------------------------------------------------------
 
-fn run_search_gpu(
-    args: &Args,
-    slots: &[Slot],
-    target_mode: &TargetMode,
-    language: Language,
-) -> Result<bool> {
-    let gpu_handle = gpu::Gpu::new()?;
-    let wordlist: &'static [&'static str] = language.words_by_prefix("");
-    let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
- 
-    let probe_h160 = [0u8; 20];
-    let batch_size = if let Some(b) = args.batch_size {
-        println!("Using GPU (CUDA) — batch_size: {} (manual override)", format_number(b));
-        b
-    } else {
-        probe_batch_size(&gpu_handle, &gpu_wordlist, &probe_h160, args.min_batch, args.max_batch)
-    };
- 
-    let mode_label: &'static str = match target_mode {
-        TargetMode::Hash160(_) => "address/hash160 (SHA256+RIPEMD160 per candidate)",
-        TargetMode::Pubkey(_)  => "pubkey33        (skip SHA256+RIPEMD160, ~30% faster)",
-    };
-    println!("Search mode : {}", mode_label);
- 
-    let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
-    let max_token = slots.len();
-    println!("Trying slot subsets {min_token}..={max_token}.");
- 
-    // Print progress every ~100K candidates
-    let progress_interval = 100_000;
- 
-    let search_wall = Instant::now();
-    let mut all_stats: Vec<CombinationStats> = Vec::new();
- 
-    for slot_count in min_token..=max_token {
-        let slot_indices: Vec<usize> = (0..slots.len()).collect();
- 
-        for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
-            let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
- 
-            println!(
-                "\n── Combination {:?} ──────────────────────────",
-                chosen_indices
-            );
-            let _ = io::stdout().flush();
- 
-            // ProgressIter counts + prints throughput every 100K
-            let base_iter = LazyPhraseIter::new(
-                &chosen,
-                args.keep_token_order,
-                args.keep_word_order,
-                wordlist,
-            );
-            let prog_iter = ProgressIter::new(base_iter, progress_interval);
- 
-            let t_comb = Instant::now();
- 
-            let (result, candidates_sent) = {
-                // We need to move prog_iter into search, but also read count after.
-                // Workaround: use a shared AtomicUsize updated by ProgressIter.
-                // Simpler: re-count via a second iter after — but that wastes time.
-                // Best: ProgressIter stores count internally; we read it after via
-                // a RefCell or just accept that gpu.search() consumes the iterator.
-                //
-                // Since gpu.search() takes ownership of the iterator, we wrap in
-                // a counting adapter that stores the final count in an Arc<AtomicUsize>.
-                let sent = Arc::new(AtomicUsize::new(0));
-                let sent_clone = Arc::clone(&sent);
- 
-                struct CountingIter<I> {
-                    inner: I,
-                    counter: Arc<AtomicUsize>,
-                }
-                impl<I: Iterator<Item = [u16; 12]>> Iterator for CountingIter<I> {
-                    type Item = [u16; 12];
-                    fn next(&mut self) -> Option<[u16; 12]> {
-                        let item = self.inner.next()?;
-                        self.counter.fetch_add(1, Ordering::Relaxed);
-                        Some(item)
-                    }
-                }
- 
-                let counting_iter = CountingIter {
-                    inner: prog_iter,
-                    counter: sent_clone,
-                };
- 
-                let res = match target_mode {
-                    TargetMode::Hash160(h160) =>
-                        gpu_handle.search(counting_iter, &gpu_wordlist, h160, batch_size)?,
-                    TargetMode::Pubkey(pubkey) =>
-                        gpu_handle.search_pubkey(counting_iter, &gpu_wordlist, pubkey, batch_size)?,
-                };
- 
-                (res, sent.load(Ordering::Relaxed))
-            };
-            println!(); // ← TAMBAH INI: turun ke baris baru setelah progress \r
-            let comb_elapsed = t_comb.elapsed();
-            let tp = candidates_sent as f64 / comb_elapsed.as_secs_f64().max(0.001);
- 
-            let stat = CombinationStats {
-                mode_label,
-                combination: chosen_indices.clone(),
-                candidates_sent,
-                elapsed: comb_elapsed,
-            };
-            stat.print();
-            all_stats.push(stat);
- 
-            match result {
-                Some(hit) => {
-                    let phrase: Vec<&str> =
-                        hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
- 
-                    println!("\n✓ Found matching mnemonic : {}", phrase.join(" "));
-                    println!("  Candidate index         : {}", hit.global_index);
-                    println!("  Combination             : {:?}", chosen_indices);
-                    println!("  Candidates checked      : {}", format_number(candidates_sent));
-                    println!("  Time for combination    : {:.3}s", comb_elapsed.as_secs_f64());
-                    println!("  Throughput              : {}/s", format_number(tp as usize));
-                    println!("  Total wall time         : {:.3}s", search_wall.elapsed().as_secs_f64());
-                    match target_mode {
-                        TargetMode::Hash160(_) =>
-                            println!("  Match type              : address/hash160"),
-                        TargetMode::Pubkey(pk) =>
-                            println!("  Match type              : pubkey {}", bytes_to_hex(pk)),
-                    }
- 
-                    // Print comparison table across all combinations tried
-                    if all_stats.len() > 1 {
-                        println!("\n  ── Timing comparison ────────────────────");
-                        for s in &all_stats {
-                            s.print();
-                        }
-                        println!("  ─────────────────────────────────────────");
-                    }
- 
-                    let _ = io::stdout().flush();
-                    std::mem::forget(gpu_handle);
-                    std::process::exit(0);
-                }
-                None => {
-                    println!(
-                        "  No match. Wall time so far: {:.3}s",
-                        search_wall.elapsed().as_secs_f64(),
-                    );
-                }
-            }
-        }
-    }
- 
-    // Exhausted — print final summary table
-    let total_wall = search_wall.elapsed();
-    let total_cands: usize = all_stats.iter().map(|s| s.candidates_sent).sum();
-    let total_tp = total_cands as f64 / total_wall.as_secs_f64().max(0.001);
- 
-    println!("\n── Final summary ────────────────────────────");
-    for s in &all_stats {
-        s.print();
-    }
-    println!(
-        "  TOTAL  {:>10} candidates | {:.3}s | {}/s",
-        format_number(total_cands),
-        total_wall.as_secs_f64(),
-        format_number(total_tp as usize),
-    );
-    println!("─────────────────────────────────────────────");
- 
-    std::mem::forget(gpu_handle);
-    Ok(false)
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 { format!("{}h{:02}m{:02}s", s/3600, (s%3600)/60, s%60) }
+    else if s >= 60 { format!("{}m{:02}s", s/60, s%60) }
+    else { format!("{}s", s) }
 }
- 
- 
-/// Adaptive batch size probe.
-///
-/// Mulai dari START (64K), jalankan batch dummy.
-/// Sukses → naikkan 2x. Gagal (OOM/error) → pakai yang terakhir sukses.
-/// Berhenti jika batch sudah >500 MB (transfer overhead mulai dominan).
-fn probe_batch_size(
-    gpu: &gpu::Gpu,
-    wordlist: &gpu::GpuWordlist,
-    target_h160: &[u8; 20],
-    min_exp: u32,  // start = 2^min_exp  (e.g. 16 = 65 536)
-    max_exp: u32,  // cap   = 2^max_exp  (e.g. 28 = 268M, or 16 to hard-cap at 65K)
-) -> usize {
-    let start: usize = 1usize.checked_shl(min_exp).unwrap_or(1 << 16);
-    let max:   usize = 1usize.checked_shl(max_exp).unwrap_or(1 << 28);
 
-    fn make_dummy(n: usize) -> impl Iterator<Item = [u16; 12]> {
-        (0..n).map(|_| [0u16; 12])
-    }
+// ===========================================================================
+// BATCH SIZE PROBE
+// ===========================================================================
+
+const BYTES_PER_CAND: usize = 28; // d_cand(24) + d_survivors(4)
+
+fn probe_batch_size(
+    gpu:      &gpu::Gpu,
+    wordlist: &gpu::GpuWordlist,
+    h160:     &[u8; 20],
+    min_exp:  u32,
+    max_exp:  u32,
+    pipeline: &str,
+) -> usize {
+    let start = 1usize.checked_shl(min_exp).unwrap_or(1 << 16);
+    let cap   = 1usize.checked_shl(max_exp).unwrap_or(1 << 28);
+
+    fn dummy(n: usize) -> impl Iterator<Item = [u16; 12]> { (0..n).map(|_| [0u16; 12]) }
 
     let mut batch   = start;
     let mut last_ok = start;
 
-    println!(
-        "Probing GPU batch size: 2^{min_exp}={} .. 2^{max_exp}={}",
-        format_number(start),
-        format_number(max),
-    );
+    println!("Probing GPU batch (2^{min_exp}={} .. 2^{max_exp}={}):",
+        format_number(start), format_number(cap));
 
     loop {
-        let t0      = std::time::Instant::now();
-        let result  = gpu.search(make_dummy(batch), wordlist, target_h160, batch);
-        let elapsed = t0.elapsed();
+        let t  = Instant::now();
+        let ok = gpu.search(dummy(batch), wordlist, h160, batch, pipeline);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let tp = batch as f64 / t.elapsed().as_secs_f64().max(0.001);
 
-        match result {
+        match ok {
             Ok(_) => {
-                let throughput = batch as f64 / elapsed.as_secs_f64();
-                println!(
-                    "  batch {:>10} → OK  ({:.1} MB, {}/s, {:.0}ms)",
+                println!("  {:>10} → OK  | {:.1} MB | {}/s | {:.0}ms",
                     format_number(batch),
-                    (batch * BYTES_PER_CAND_TOTAL) as f64 / (1024.0 * 1024.0),
-                    format_number(throughput as usize),
-                    elapsed.as_millis(),
-                );
+                    (batch * BYTES_PER_CAND) as f64 / (1024.0*1024.0),
+                    format_number(tp as usize), ms);
                 last_ok = batch;
-
                 let next = batch.saturating_mul(2);
-                if next > max {
-                    println!("  → reached --max-batch cap (2^{max_exp}={}).", format_number(max));
-                    break;
-                }
+                if next > cap { println!("  → cap 2^{max_exp}={}", format_number(cap)); break; }
                 batch = next;
             }
             Err(e) => {
-                println!(
-                    "  batch {:>10} → GAGAL ({:#}), pakai: {}",
-                    format_number(batch),
-                    e,
-                    format_number(last_ok),
-                );
+                println!("  {:>10} → FAIL ({e:#}), using {}", format_number(batch), format_number(last_ok));
                 break;
             }
         }
     }
 
-    let final_mb = (last_ok * BYTES_PER_CAND_TOTAL) as f64 / (1024.0 * 1024.0);
-    println!(
-        "Using GPU (CUDA) — batch_size: {} ({final_mb:.1} MB/batch)",
+    println!("  Batch size : {} ({:.1} MB/batch)\n",
         format_number(last_ok),
-    );
-    let _ = io::stdout().flush();
+        (last_ok * BYTES_PER_CAND) as f64 / (1024.0*1024.0));
     last_ok
 }
 
-// ---------------------------------------------------------------------------
-// Batch size constants
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// TOKENLIST — GPU
+// ===========================================================================
 
-/// VRAM bytes consumed per candidate across all active DeviceBuffers in gpu.search():
-///   d_cand:      12 × u16  = 24 bytes
-///   d_survivors:  1 × u32  =  4 bytes
-const BYTES_PER_CAND_TOTAL: usize = 28;
-
-
-// ---------------------------------------------------------------------------
-// CPU search (unchanged from original, kept for --cpu fallback)
-// ---------------------------------------------------------------------------
-
-fn run_search_cpu(
-    args: &Args,
-    slots: &[Slot],
-    target_mode: &TargetMode,
+fn run_tokenlist_gpu(
+    args:     &Args,
+    slots:    &[Slot],
+    target:   &Target,
     language: Language,
+    coin:     Coin,
 ) -> Result<bool> {
-    let num_threads = if args.threads == 0 {
-        num_cpus::get()
-    } else {
-        args.threads
-    };
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global();
-    println!("Using CPU with {num_threads} threads.");
+    let gpu_handle  = gpu::Gpu::new()?;
+    let wordlist    = language.words_by_prefix("");
+    let gpu_wl      = gpu::GpuWordlist::new(wordlist)?;
+    let h160        = target_hash20(target)?;
+    let pipeline    = pipeline_kernel(coin);
+    let target_disp = target.as_display_string();
 
-    let wordlist: &'static [&'static str] = language.words_by_prefix("");
-    let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
+    let batch_size = args.batch_size.unwrap_or_else(||
+        probe_batch_size(&gpu_handle, &gpu_wl, &[0u8;20], args.min_batch, args.max_batch, pipeline));
+
+    let min_tok = args.min_token.unwrap_or(slots.len()).min(slots.len());
+    let max_tok = slots.len();
+    println!("Using GPU (CUDA) — tokenlist mode — batch {}", format_number(batch_size));
+    println!("Slot subsets: {min_tok}..={max_tok}");
+
+    let wall = Instant::now();
+
+    for slot_count in min_tok..=max_tok {
+        for chosen_idx in (0..slots.len()).combinations(slot_count) {
+            let chosen: Vec<&Slot> = chosen_idx.iter().map(|&i| &slots[i]).collect();
+
+            println!("\nSlot combination {:?}", chosen_idx);
+            let _ = io::stdout().flush();
+
+            let iter = ProgressIter::new(
+                LazyPhraseIter::new(&chosen, args.keep_token_order, args.keep_word_order, wordlist),
+                None, // total unknown without double-iteration
+                100_000,
+            );
+
+            let t = Instant::now();
+            let hit = gpu_handle.search(iter, &gpu_wl, &h160, batch_size, pipeline)?;
+            println!(); // newline after \r progress
+
+            let secs = t.elapsed().as_secs_f64();
+
+            match hit {
+                Some(h) => {
+                    let phrase: Vec<&str> = h.indices.iter().map(|&i| wordlist[i as usize]).collect();
+                    println!("Mnemonic : {}", phrase.join(" "));
+                    println!("Index    : {}", h.global_index);
+                    println!("Address  : {target_disp}");
+                    println!("Time     : {:.3}s | Throughput: {}/s",
+                        secs,
+                        format_number((h.global_index as f64 / secs.max(0.001)) as usize));
+                    println!("Wall     : {:.3}s total", wall.elapsed().as_secs_f64());
+                    let _ = io::stdout().flush();
+                    std::mem::forget(gpu_handle);
+                    std::process::exit(0);
+                }
+                None => println!("  No match ({:.3}s)", secs),
+            }
+        }
+    }
+
+    std::mem::forget(gpu_handle);
+    Ok(false)
+}
+
+// ===========================================================================
+// TOKENLIST — CPU
+// ===========================================================================
+
+fn run_tokenlist_cpu(
+    args:     &Args,
+    slots:    &[Slot],
+    target:   &Target,
+    language: Language,
+    coin:     Coin,
+    deriv:    &DerivationPath,
+) -> Result<bool> {
+    let num_threads = if args.threads == 0 { num_cpus::get() } else { args.threads };
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global();
+
+    let wordlist    = language.words_by_prefix("");
+    let target_str  = target.as_compare_string();
+    let target_disp = target.as_display_string();
     let secp = Arc::new(Secp256k1::new());
-    // Clone target_mode data into Arc for thread sharing.
-    let target_mode = Arc::new(target_mode.clone());
 
-    let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
-    let max_token = slots.len();
-    println!("Trying slot subsets {min_token}..={max_token}.");
+    let min_tok = args.min_token.unwrap_or(slots.len()).min(slots.len());
+    let max_tok = slots.len();
+    println!("Using CPU ({num_threads} threads) — tokenlist mode");
+    println!("Slot subsets: {min_tok}..={max_tok}");
 
     let counter      = Arc::new(AtomicUsize::new(0));
     let found        = Arc::new(AtomicBool::new(false));
     let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
     let found_index  = Arc::new(AtomicUsize::new(0));
-    let cpu_start    = Arc::new(Instant::now());         // ← TAMBAH INI
- 
-    'outer: for slot_count in min_token..=max_token {
-        if found.load(Ordering::Relaxed) {
-            break;
-        }
+    let start        = Instant::now();
 
-        let slot_indices: Vec<usize> = (0..slots.len()).collect();
+    'outer: for slot_count in min_tok..=max_tok {
+        if found.load(Ordering::Relaxed) { break; }
 
-        for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
-            if found.load(Ordering::Relaxed) {
-                break 'outer;
-            }
+        for chosen_idx in (0..slots.len()).combinations(slot_count) {
+            if found.load(Ordering::Relaxed) { break 'outer; }
 
-            let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
+            let chosen: Vec<&Slot> = chosen_idx.iter().map(|&i| &slots[i]).collect();
+            println!("\nSlot combination {:?}", chosen_idx);
 
-            // CPU path: collect to Vec is OK here since Rayon parallelises over it.
-            // For very large sets (>100M) consider switching to LazyPhraseIter here too.
-            let phrases: Vec<Vec<u16>> = enumerate_phrases(
-                &chosen,
-                args.keep_token_order,
-                args.keep_word_order,
-                wordlist,
-            )
-            .into_iter()
-            .filter(|p| p.len() == 12)
-            .collect();
-
-            println!(
-                "Slot combination {:?}: {} phrase(s) to check on CPU.",
-                chosen_indices,
-                format_number(phrases.len()),
+            let iter = LazyPhraseIter::new(
+                &chosen, args.keep_token_order, args.keep_word_order, wordlist,
             );
-            let _ = io::stdout().flush();
+            let interval = 100_000usize;
 
-            phrases.into_par_iter().for_each(|phrase_indices: Vec<u16>| {
-                if found.load(Ordering::Relaxed) {
-                    return;
-                }
+            iter.par_bridge().for_each(|phrase_idx| {
+                if found.load(Ordering::Relaxed) { return; }
+
                 let i = counter.fetch_add(1, Ordering::Relaxed);
-                if i % 100_000 == 0 && i > 0 {
-                    let secs = cpu_start.elapsed().as_secs_f64();
-                    let tp   = if secs > 0.0 { i as f64 / secs } else { 0.0 };
-                    print!(
-                        "
-  {:>10} candidates | {:>7.1}s | {:>8}/s avg   ",
-                        format_number(i),
-                        secs,
-                        format_number(tp as usize),
-                    );
+                if i % interval == 0 && i > 0 {
+                    let s  = start.elapsed().as_secs_f64();
+                    let tp = i as f64 / s.max(0.001);
+                    print!("\r  {:>10} seeds | {:>6.1}s | {}/s   ",
+                        format_number(i), s, format_number(tp as usize));
                     let _ = io::stdout().flush();
                 }
- 
 
-                let phrase: Vec<&str> =
-                    phrase_indices.iter().map(|&idx| wordlist[idx as usize]).collect();
+                let phrase: Vec<&str> = phrase_idx.iter().map(|&idx| wordlist[idx as usize]).collect();
                 let phrase_str = phrase.join(" ");
 
-                let mnemonic =
-                    match Mnemonic::parse_in_normalized(language, &phrase_str) {
-                        Ok(m) => m,
-                        Err(_) => return,
-                    };
-
+                let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase_str) {
+                    Ok(m) => m, Err(_) => return,
+                };
                 let seed = mnemonic.to_seed("");
-                let master_xprv = match Xpriv::new_master(Network::Bitcoin, &seed) {
-                    Ok(x) => x,
-                    Err(_) => return,
+                let master = match Xpriv::new_master(Network::Bitcoin, &seed) {
+                    Ok(x) => x, Err(_) => return,
                 };
-                let child_xprv =
-                    match master_xprv.derive_priv(&secp, &derivation_path) {
-                        Ok(x) => x,
-                        Err(_) => return,
-                    };
-                let child_pub =
-                    PublicKey::new(child_xprv.private_key.public_key(&secp));
-
-                // Compare based on target mode.
-                let matched = match target_mode.as_ref() {
-                    TargetMode::Hash160(h160) => {
-                        // Compute hash160 and compare.
-                        let addr: Address<NetworkChecked> =
-                            Address::p2pkh(&child_pub, Network::Bitcoin);
-                        let spk = addr.script_pubkey();
-                        let b = spk.as_bytes();
-                        if b.len() == 25 {
-                            b[3..23] == h160[..]
-                        } else {
-                            false
-                        }
+                let child = match master.derive_priv(&secp, deriv) {
+                    Ok(x) => x, Err(_) => return,
+                };
+                let addr_str = match coin {
+                    Coin::Btc => {
+                        let pub_key = PublicKey::new(child.private_key.public_key(&secp));
+                        Address::p2pkh(&pub_key, Network::Bitcoin).to_string()
                     }
-                    TargetMode::Pubkey(target_pk) => {
-                        // Compare compressed pubkey directly — faster (no hash needed).
-                        let pk_bytes = child_pub.inner.serialize();
-                        &pk_bytes == target_pk
-                    }
+                    Coin::Eth => eth_address_from_privkey(&child.private_key, &secp),
                 };
 
-                if matched {
+                if addr_str == target_str {
                     found.store(true, Ordering::SeqCst);
                     found_index.store(i, Ordering::SeqCst);
                     *found_phrase.lock().unwrap() = phrase_str;
                 }
             });
 
-            if found.load(Ordering::SeqCst) {
-                break 'outer;
-            }
+            println!();
+            if found.load(Ordering::SeqCst) { break 'outer; }
         }
     }
 
-    println!();
-
-        if found.load(Ordering::SeqCst) {
-        let fp    = found_phrase.lock().unwrap();
-        let idx   = found_index.load(Ordering::SeqCst);
-        let secs  = cpu_start.elapsed().as_secs_f64();
-        let tp    = if secs > 0.0 { idx as f64 / secs } else { 0.0 };
-        let mode_label = match target_mode.as_ref() {
-            TargetMode::Hash160(_) => "address/hash160 (CPU)",
-            TargetMode::Pubkey(_)  => "pubkey33 — no hash (CPU, faster)",
-        };
-        println!("\n✓ Found matching mnemonic: {fp}");
-        println!("  Candidate index (0-based): {idx}");
-        println!("  Time to find  : {:.3}s", secs);
-        println!("  Throughput    : {}/s", format_number(tp as usize));
-        match target_mode.as_ref() {
-            TargetMode::Hash160(_) => {
-                let m = Mnemonic::parse_in_normalized(language, &*fp).unwrap();
-                let seed = m.to_seed("");
-                let secp2 = Secp256k1::new();
-                let deriv: DerivationPath = "m/44'/0'/0'/0/0".parse().unwrap();
-                if let Ok(xprv) = Xpriv::new_master(Network::Bitcoin, &seed) {
-                    if let Ok(child) = xprv.derive_priv(&secp2, &deriv) {
-                        let pub2 = PublicKey::new(child.private_key.public_key(&secp2));
-                        let addr = Address::p2pkh(&pub2, Network::Bitcoin);
-                        println!("  Derived address: {addr}");
-                    }
-                }
-            }
-            TargetMode::Pubkey(pk) => println!("  Matched pubkey: {}", bytes_to_hex(pk)),
-        }
-        println!("─────────────────────────────────────────");
-        println!("  Mode       : {}", mode_label);
-        println!("  Elapsed    : {:.3}s", secs);
-        println!("  Throughput : {}/s", format_number(tp as usize));
-        println!("─────────────────────────────────────────");
+    let secs = start.elapsed().as_secs_f64();
+    if found.load(Ordering::SeqCst) {
+        let fp  = found_phrase.lock().unwrap();
+        let idx = found_index.load(Ordering::SeqCst);
+        println!("Mnemonic : {}", *fp);
+        println!("Index    : {idx}");
+        println!("Address  : {target_disp}");
+        println!("Time     : {:.3}s | Throughput: {}/s",
+            secs, format_number((idx as f64 / secs.max(0.001)) as usize));
         Ok(true)
     } else {
         Ok(false)
     }
 }
 
-// ---------------------------------------------------------------------------
-// enumerate_phrases — dipakai oleh CPU path
-// (GPU path pakai LazyPhraseIter di atas)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// WORD MODE — GPU
+// ===========================================================================
 
-fn enumerate_phrases(
-    chosen_slots: &[&Slot],
-    keep_token_order: bool,
-    keep_word_order: bool,
-    wordlist: &'static [&'static str],
-) -> Vec<Vec<u16>> {
-    let wordlist_len = wordlist.len();
+fn run_word_gpu(
+    args:     &Args,
+    target:   &Target,
+    language: Language,
+    coin:     Coin,
+) -> Result<bool> {
+    let gpu_handle  = gpu::Gpu::new()?;
+    let wordlist    = language.words_by_prefix("");
+    let gpu_wl      = gpu::GpuWordlist::new(wordlist)?;
+    let h160        = target_hash20(target)?;
+    let pipeline    = pipeline_kernel(coin);
+    let target_disp = target.as_display_string();
 
-    let slot_alt_candidates: Vec<Vec<Vec<Vec<u16>>>> = chosen_slots
-        .iter()
-        .map(|slot| {
-            slot.iter()
-                .map(|alt| {
-                    let (known_words, missing_positions) = expand_alternative(alt);
-                    let total_len = alt.len();
-                    let known_indices: Vec<u16> = known_words
-                        .iter()
-                        .map(|w| {
-                            wordlist
-                                .iter()
-                                .position(|x| *x == w.as_str())
-                                .unwrap() as u16
-                        })
-                        .collect();
-                    slot_candidates(
-                        &known_indices,
-                        &missing_positions,
-                        total_len,
-                        keep_word_order,
-                        wordlist_len,
-                    )
-                })
-                .collect()
-        })
-        .collect();
+    let batch_size = args.batch_size.unwrap_or_else(||
+        probe_batch_size(&gpu_handle, &gpu_wl, &h160, args.min_batch, args.max_batch, pipeline));
 
-    let num_slots = chosen_slots.len();
-    let slot_orderings: Vec<Vec<usize>> = if keep_token_order {
-        vec![(0..num_slots).collect()]
-    } else {
-        (0..num_slots).permutations(num_slots).collect()
-    };
+    let mut known_idx: Vec<u16> = Vec::new();
+    for w in &args.words {
+        let pos = wordlist.iter().position(|x| *x == w.as_str())
+            .with_context(|| format!("'{w}' not in BIP-39 wordlist"))?;
+        known_idx.push(pos as u16);
+    }
 
-    let mut results: Vec<Vec<u16>> = Vec::new();
+    let missing = 12 - args.words.len();
+    let total   = total_candidates(args.words.len(), wordlist.len(), missing);
 
-    for order in &slot_orderings {
-        let alt_counts: Vec<usize> =
-            order.iter().map(|&si| slot_alt_candidates[si].len()).collect();
+    println!("Using GPU (CUDA) — word mode — batch {}", format_number(batch_size));
+    if missing > 0 {
+        println!("Completing {missing} missing word(s) from {} BIP-39 words.", wordlist.len());
+    }
+    println!("Total candidates: {}", format_number(total));
 
-        for alt_indices in alt_counts.iter().map(|&n| 0..n).multi_cartesian_product() {
-            let per_slot: Vec<&Vec<Vec<u16>>> = order
-                .iter()
-                .zip(alt_indices.iter())
-                .map(|(&si, &ai)| &slot_alt_candidates[si][ai])
-                .collect();
+    let cand_iter = candidates::stream(known_idx, wordlist.len());
+    let prog_iter = ProgressIter::new(cand_iter, Some(total), 100_000);
 
-            let cand_counts: Vec<usize> = per_slot.iter().map(|c| c.len()).collect();
-            for cand_indices in
-                cand_counts.iter().map(|&n| 0..n).multi_cartesian_product()
-            {
-                let phrase: Vec<u16> = per_slot
-                    .iter()
-                    .zip(cand_indices.iter())
-                    .flat_map(|(cands, &ci)| cands[ci].iter().copied())
-                    .collect();
-                results.push(phrase);
+    let t   = Instant::now();
+    let hit = gpu_handle.search(prog_iter, &gpu_wl, &h160, batch_size, pipeline)?;
+    println!(); // newline after \r
+    let secs = t.elapsed().as_secs_f64();
+
+    match hit {
+        Some(h) => {
+            let phrase: Vec<&str> = h.indices.iter().map(|&i| wordlist[i as usize]).collect();
+            let phrase_str = phrase.join(" ");
+            if missing > 0 {
+                println!("Recovered : {}", recovered_words(&args.words, &phrase_str).join(" "));
             }
+            println!("Mnemonic  : {}", phrase_str);
+            println!("Index     : {}", h.global_index);
+            println!("Address   : {target_disp}");
+            println!("Time      : {:.3}s | Throughput: {}/s",
+                secs, format_number((h.global_index as f64 / secs.max(0.001)) as usize));
+            let _ = io::stdout().flush();
+            std::mem::forget(gpu_handle);
+            std::process::exit(0);
         }
-    }
-
-    results
-}
-
-// ---------------------------------------------------------------------------
-// Permutations-with-replacement helper
-// ---------------------------------------------------------------------------
-
-trait PermutationsWithReplacement: Iterator + Sized {
-    fn permutations_with_replacement(self, k: usize) -> PermWithReplacement<Self::Item>
-    where
-        Self::Item: Clone;
-}
-
-struct PermWithReplacement<T> {
-    pool: Vec<T>,
-    indices: Vec<usize>,
-    k: usize,
-    first: bool,
-    done: bool,
-}
-
-impl<I: Iterator> PermutationsWithReplacement for I
-where
-    I::Item: Clone,
-{
-    fn permutations_with_replacement(self, k: usize) -> PermWithReplacement<I::Item> {
-        let pool: Vec<I::Item> = self.collect();
-        let n = pool.len();
-        if k == 0 || n == 0 {
-            return PermWithReplacement {
-                pool,
-                indices: vec![],
-                k,
-                first: true,
-                done: k != 0,
-            };
-        }
-        PermWithReplacement {
-            pool,
-            indices: vec![0usize; k],
-            k,
-            first: true,
-            done: false,
+        None => {
+            println!("No match. {:.3}s | {}/s",
+                secs, format_number((total as f64 / secs.max(0.001)) as usize));
+            std::mem::forget(gpu_handle);
+            Ok(false)
         }
     }
 }
 
-impl<T: Clone> Iterator for PermWithReplacement<T> {
-    type Item = Vec<T>;
+// ===========================================================================
+// WORD MODE — CPU
+// ===========================================================================
 
-    fn next(&mut self) -> Option<Vec<T>> {
-        if self.done {
-            return None;
-        }
-        if self.k == 0 {
-            self.done = true;
-            return Some(vec![]);
-        }
-        if self.first {
-            self.first = false;
-            return Some(
-                self.indices.iter().map(|&i| self.pool[i].clone()).collect(),
+fn run_word_cpu(
+    args:     &Args,
+    target:   &Target,
+    language: Language,
+    coin:     Coin,
+    deriv:    &DerivationPath,
+) -> Result<bool> {
+    let num_threads = if args.threads == 0 { num_cpus::get() } else { args.threads };
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global();
+
+    let wordlist    = language.words_by_prefix("");
+    let target_str  = target.as_compare_string();
+    let target_disp = target.as_display_string();
+    let secp = Arc::new(Secp256k1::new());
+
+    let missing = 12 - args.words.len();
+    let total   = total_candidates(args.words.len(), wordlist.len(), missing);
+
+    println!("Using CPU ({num_threads} threads) — word mode");
+    if missing > 0 {
+        println!("Completing {missing} missing word(s) from {} BIP-39 words.", wordlist.len());
+    }
+    println!("Total candidates: {}", format_number(total));
+
+    let counter      = Arc::new(AtomicUsize::new(0));
+    let found        = Arc::new(AtomicBool::new(false));
+    let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
+    let found_index  = Arc::new(AtomicUsize::new(0));
+    let start        = Instant::now();
+
+    let owned: Vec<String> = args.words.to_vec();
+    let candidates = owned.into_iter()
+        .permutations(args.words.len())
+        .flat_map(move |base| insert_missing(base, missing, wordlist).map(|v| v.join(" ")));
+
+    candidates.par_bridge().for_each(|phrase| {
+        if found.load(Ordering::Relaxed) { return; }
+
+        let i = counter.fetch_add(1, Ordering::Relaxed);
+        if i % 100_000 == 0 && i > 0 {
+            let s  = start.elapsed().as_secs_f64();
+            let tp = i as f64 / s.max(0.001);
+            // progress bar
+            let pct    = (i as f64 / total as f64).min(1.0);
+            let filled = (pct * 25.0) as usize;
+            let bar: String = (0..25).map(|j| if j < filled { '█' } else { '░' }).collect();
+            let eta_s  = (total - i) as f64 / tp.max(1.0);
+            print!(
+                "\r  {:>10} seeds | {:>6.1}s | {}/s [{}] {:.1}% ETA {}   ",
+                format_number(i), s, format_number(tp as usize),
+                bar, pct*100.0,
+                fmt_duration(Duration::from_secs_f64(eta_s)),
             );
+            let _ = io::stdout().flush();
         }
-        let n = self.pool.len();
-        let mut pos = self.k as isize - 1;
-        while pos >= 0 && self.indices[pos as usize] == n - 1 {
-            self.indices[pos as usize] = 0;
-            pos -= 1;
+
+        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
+            Ok(m) => m, Err(_) => return,
+        };
+        let seed   = mnemonic.to_seed("");
+        let master = match Xpriv::new_master(Network::Bitcoin, &seed) { Ok(x) => x, Err(_) => return };
+        let child  = match master.derive_priv(&secp, deriv) { Ok(x) => x, Err(_) => return };
+        let addr_str = match coin {
+            Coin::Btc => {
+                let pub_key = PublicKey::new(child.private_key.public_key(&secp));
+                Address::p2pkh(&pub_key, Network::Bitcoin).to_string()
+            }
+            Coin::Eth => eth_address_from_privkey(&child.private_key, &secp),
+        };
+
+        if addr_str == target_str {
+            found.store(true, Ordering::SeqCst);
+            found_index.store(i, Ordering::SeqCst);
+            *found_phrase.lock().unwrap() = phrase;
         }
-        if pos < 0 {
-            self.done = true;
-            return None;
+    });
+
+    println!();
+    let secs = start.elapsed().as_secs_f64();
+
+    if found.load(Ordering::SeqCst) {
+        let fp  = found_phrase.lock().unwrap();
+        let idx = found_index.load(Ordering::SeqCst);
+        if missing > 0 {
+            println!("Recovered : {}", recovered_words(&args.words, &fp).join(" "));
         }
-        self.indices[pos as usize] += 1;
-        Some(self.indices.iter().map(|&i| self.pool[i].clone()).collect())
+        println!("Mnemonic  : {}", *fp);
+        println!("Index     : {idx}");
+        println!("Address   : {target_disp}");
+        println!("Time      : {:.3}s | Throughput: {}/s",
+            secs, format_number((idx as f64 / secs.max(0.001)) as usize));
+        Ok(true)
+    } else {
+        println!("No match. {:.3}s | {}/s",
+            secs, format_number((total as f64 / secs.max(0.001)) as usize));
+        Ok(false)
     }
 }
 
-// ---------------------------------------------------------------------------
-// P2PKH helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// HELPERS
+// ===========================================================================
 
 fn p2pkh_hash160(addr: &Address<NetworkChecked>) -> Result<[u8; 20]> {
     let spk = addr.script_pubkey();
-    let bytes = spk.as_bytes();
-    if bytes.len() == 25
-        && bytes[0] == 0x76
-        && bytes[1] == 0xa9
-        && bytes[2] == 0x14
-    {
+    let b   = spk.as_bytes();
+    if b.len() == 25 && b[0] == 0x76 && b[1] == 0xa9 && b[2] == 0x14 {
         let mut h = [0u8; 20];
-        h.copy_from_slice(&bytes[3..23]);
+        h.copy_from_slice(&b[3..23]);
         Ok(h)
     } else {
-        anyhow::bail!("Target is not a legacy P2PKH address")
+        anyhow::bail!("Not a legacy P2PKH address")
     }
 }
 
-// ---------------------------------------------------------------------------
-// Misc helpers
-// ---------------------------------------------------------------------------
+fn total_candidates(n: usize, wl_len: usize, missing: usize) -> usize {
+    (1..=n).product::<usize>().max(1) * wl_len.pow(missing as u32)
+}
+
+fn insert_missing(
+    seq: Vec<String>,
+    remaining: usize,
+    wordlist: &'static [&'static str],
+) -> Box<dyn Iterator<Item = Vec<String>> + Send> {
+    if remaining == 0 { return Box::new(std::iter::once(seq)); }
+    let len = seq.len();
+    Box::new((0..=len).flat_map(move |pos| {
+        let seq = seq.clone();
+        wordlist.iter().flat_map(move |&word| {
+            let mut next = Vec::with_capacity(seq.len() + 1);
+            next.extend_from_slice(&seq[..pos]);
+            next.push(word.to_string());
+            next.extend_from_slice(&seq[pos..]);
+            insert_missing(next, remaining - 1, wordlist)
+        })
+    }))
+}
+
+fn recovered_words(known: &[String], phrase: &str) -> Vec<String> {
+    let mut rem: Vec<String> = known.to_vec();
+    let mut out = Vec::new();
+    for w in phrase.split_whitespace() {
+        if let Some(p) = rem.iter().position(|k| k == w) { rem.remove(p); }
+        else { out.push(w.to_string()); }
+    }
+    out
+}
 
 pub fn format_number(n: usize) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}G", n as f64 / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
-}
-
-fn bytes_to_hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
+    if n >= 1_000_000_000 { format!("{:.1}G", n as f64 / 1e9) }
+    else if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
+    else if n >= 1_000     { format!("{:.1}K", n as f64 / 1e3) }
+    else                   { n.to_string() }
 }
 
 fn parse_language(lang: &str) -> Result<Language> {
@@ -1200,88 +1101,6 @@ fn parse_language(lang: &str) -> Result<Language> {
         "japanese"            => Ok(Language::Japanese),
         "chinese-simplified"  => Ok(Language::SimplifiedChinese),
         "chinese-traditional" => Ok(Language::TraditionalChinese),
-        _ => anyhow::bail!(
-            "Unknown language '{lang}'. Supported: english, portuguese, spanish, \
-             french, italian, czech, korean, japanese, chinese-simplified, \
-             chinese-traditional"
-        ),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Target mode: address (hash160) or raw pubkey
-// ---------------------------------------------------------------------------
-#[derive(Default)]
-struct CombinationStats {
-    mode_label:       &'static str,
-    combination:      Vec<usize>,
-    candidates_sent:  usize,
-    elapsed:          std::time::Duration,
-}
- 
-impl CombinationStats {
-    fn throughput(&self) -> f64 {
-        let s = self.elapsed.as_secs_f64();
-        if s > 0.0 { self.candidates_sent as f64 / s } else { 0.0 }
-    }
- 
-    fn print(&self) {
-        println!(
-            "  [{:?}] {:>10} candidates | {:.3}s | {}/s | mode: {}",
-            self.combination,
-            format_number(self.candidates_sent),
-            self.elapsed.as_secs_f64(),
-            format_number(self.throughput() as usize),
-            self.mode_label,
-        );
-    }
-}
-/// What the search compares against.
-#[derive(Clone, Debug)]
-pub enum TargetMode {
-    /// Compare derived hash160 against a 20-byte value extracted from a P2PKH address.
-    Hash160([u8; 20]),
-    /// Compare derived compressed pubkey (33 bytes) directly — skips SHA256+RIPEMD160.
-    /// Faster per candidate than Hash160 mode.
-    Pubkey([u8; 33]),
-}
-
-/// Parse a hex pubkey string (66 or 130 hex chars) into a compressed 33-byte key.
-/// Uncompressed keys (04 prefix, 130 chars) are compressed on the fly.
-fn parse_pubkey_hex(hex: &str) -> Result<[u8; 33]> {
-    let hex = hex.trim();
-    let bytes = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .context("Invalid hex in --target-pubkey")?;
-
-    match bytes.len() {
-        33 => {
-            // Compressed — validate prefix.
-            anyhow::ensure!(
-                bytes[0] == 0x02 || bytes[0] == 0x03,
-                "--target-pubkey: compressed key must start with 02 or 03, got {:02x}",
-                bytes[0]
-            );
-            let mut out = [0u8; 33];
-            out.copy_from_slice(&bytes);
-            Ok(out)
-        }
-        65 => {
-            // Uncompressed — convert to compressed via secp256k1.
-            anyhow::ensure!(
-                bytes[0] == 0x04,
-                "--target-pubkey: uncompressed key must start with 04, got {:02x}",
-                bytes[0]
-            );
-            let pk = Secp256k1PubKey::from_slice(&bytes)
-                .context("--target-pubkey: invalid uncompressed pubkey bytes")?;
-            Ok(pk.serialize()) // always compressed 33 bytes
-        }
-        n => anyhow::bail!(
-            "--target-pubkey must be 66 hex chars (compressed) or 130 hex chars (uncompressed), got {} hex chars ({} bytes)",
-            hex.len(), n
-        ),
+        _ => anyhow::bail!("Unknown language '{lang}'"),
     }
 }
