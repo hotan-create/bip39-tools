@@ -558,6 +558,26 @@ impl Iterator for LazyPhraseIter {
 // PROGRESS ITERATOR — single overwriting line, seed/s display
 // ===========================================================================
 
+/// Best-effort terminal column count (falls back to a conservative default).
+/// Progress lines size their bar to this so long lines don't wrap — a
+/// wrapped `\r` line returns to the start of the *wrapped* row, not the
+/// original one, which is what made progress look like it was scrolling.
+#[cfg(target_os = "linux")]
+fn terminal_width() -> usize {
+    #[repr(C)]
+    struct Winsize { row: u16, col: u16, xpixel: u16, ypixel: u16 }
+    extern "C" {
+        fn ioctl(fd: i32, request: u64, argp: *mut Winsize) -> i32;
+    }
+    const TIOCGWINSZ: u64 = 0x5413;
+    let mut ws = Winsize { row: 0, col: 0, xpixel: 0, ypixel: 0 };
+    let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0;
+    if ok && ws.col > 0 { ws.col as usize } else { 100 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminal_width() -> usize { 100 }
+
 struct ProgressIter<I> {
     inner:    I,
     count:    usize,
@@ -587,7 +607,14 @@ impl<I: Iterator<Item = [u16; 12]>> Iterator for ProgressIter<I> {
             let avg_tp   = self.count as f64 / total_s.max(0.001);
             let rec_tp   = self.interval as f64 / recent_s;
 
-            // Optional ETA
+            let fixed = format!(
+                "  {:>10} seeds | {:>6.1}s | avg {:>8}/s | recent {:>8}/s",
+                format_number(self.count),
+                total_s,
+                format_number(avg_tp as usize),
+                format_number(rec_tp as usize),
+            );
+
             let eta_str = match self.total {
                 Some(tot) if tot > self.count => {
                     let remaining = tot - self.count;
@@ -596,27 +623,29 @@ impl<I: Iterator<Item = [u16; 12]>> Iterator for ProgressIter<I> {
                 }
                 _ => String::new(),
             };
-
-            // Progress bar (30 chars wide)
-            let bar_str = match self.total {
+            let pct_str = match self.total {
                 Some(tot) if tot > 0 => {
-                    let pct   = (self.count as f64 / tot as f64).min(1.0);
-                    let filled = (pct * 30.0) as usize;
-                    let bar: String = (0..30).map(|i| if i < filled { '█' } else { '░' }).collect();
-                    format!(" [{}] {:.1}%", bar, pct * 100.0)
+                    format!(" {:.1}%", (self.count as f64 / tot as f64 * 100.0).min(100.0))
                 }
                 _ => String::new(),
             };
 
-            print!(
-                "\r  {:>10} seeds | {:>6.1}s | avg {:>8}/s | recent {:>8}/s{}{}   ",
-                format_number(self.count),
-                total_s,
-                format_number(avg_tp as usize),
-                format_number(rec_tp as usize),
-                bar_str,
-                eta_str,
-            );
+            // Size the bar to whatever room is left after the fixed text, so
+            // the whole line stays within the terminal width and never wraps.
+            let width    = terminal_width();
+            let reserved = fixed.chars().count() + eta_str.chars().count() + pct_str.chars().count() + 4; // " [" + "]" + margin
+            let bar_width = width.saturating_sub(reserved).min(30);
+
+            let bar_str = if bar_width > 0 && matches!(self.total, Some(tot) if tot > 0) {
+                let pct = (self.count as f64 / self.total.unwrap() as f64).min(1.0);
+                let filled = (pct * bar_width as f64) as usize;
+                let bar: String = (0..bar_width).map(|i| if i < filled { '█' } else { '░' }).collect();
+                format!(" [{}]", bar)
+            } else {
+                String::new()
+            };
+
+            print!("\r{fixed}{bar_str}{pct_str}{eta_str}\x1B[K");
             let _ = io::stdout().flush();
             self.last = Instant::now();
         }
@@ -808,7 +837,7 @@ fn run_tokenlist_cpu(
                 if i % interval == 0 && i > 0 {
                     let s  = start.elapsed().as_secs_f64();
                     let tp = i as f64 / s.max(0.001);
-                    print!("\r  {:>10} seeds | {:>6.1}s | {}/s   ",
+                    print!("\r  {:>10} seeds | {:>6.1}s | {}/s\x1B[K",
                         format_number(i), s, format_number(tp as usize));
                     let _ = io::stdout().flush();
                 }
@@ -976,17 +1005,25 @@ fn run_word_cpu(
         if i % 100_000 == 0 && i > 0 {
             let s  = start.elapsed().as_secs_f64();
             let tp = i as f64 / s.max(0.001);
-            // progress bar
-            let pct    = (i as f64 / total as f64).min(1.0);
-            let filled = (pct * 25.0) as usize;
-            let bar: String = (0..25).map(|j| if j < filled { '█' } else { '░' }).collect();
             let eta_s  = (total - i) as f64 / tp.max(1.0);
-            print!(
-                "\r  {:>10} seeds | {:>6.1}s | {}/s [{}] {:.1}% ETA {}   ",
-                format_number(i), s, format_number(tp as usize),
-                bar, pct*100.0,
-                fmt_duration(Duration::from_secs_f64(eta_s)),
-            );
+
+            let fixed = format!("  {:>10} seeds | {:>6.1}s | {}/s", format_number(i), s, format_number(tp as usize));
+            let eta_str = format!(" ETA {}", fmt_duration(Duration::from_secs_f64(eta_s)));
+            let pct = (i as f64 / total as f64).min(1.0);
+            let pct_str = format!(" {:.1}%", pct * 100.0);
+
+            let width     = terminal_width();
+            let reserved  = fixed.chars().count() + eta_str.chars().count() + pct_str.chars().count() + 4;
+            let bar_width = width.saturating_sub(reserved).min(25);
+            let bar_str = if bar_width > 0 {
+                let filled = (pct * bar_width as f64) as usize;
+                let bar: String = (0..bar_width).map(|j| if j < filled { '█' } else { '░' }).collect();
+                format!(" [{}]", bar)
+            } else {
+                String::new()
+            };
+
+            print!("\r{fixed}{bar_str}{pct_str}{eta_str}\x1B[K");
             let _ = io::stdout().flush();
         }
 
