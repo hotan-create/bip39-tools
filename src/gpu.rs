@@ -389,8 +389,6 @@ impl Gpu {
             batch_start += n;
             let short_batch = n < batch_size;
             let _ = empty_tx.send(buf);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
             if short_batch {
                 break None; // last (partial) batch
             }
