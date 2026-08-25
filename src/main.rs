@@ -9,6 +9,7 @@ use itertools::Itertools;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use sha3::{Digest, Keccak256};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ struct Args {
     target_address: Option<String>,
 
     /// Known words (word mode only). 10, 11, or 12 words.
+    /// A word wrapped in literal double quotes (e.g. "tornado") is pinned:
+    /// kept at its position, excluded from permutation.
     /// Omit when using --tokenlist.
     words: Vec<String>,
 
@@ -47,11 +50,14 @@ struct Args {
     /// • Alternatives within a line separated by whitespace.
     /// • Words within an alternative separated by commas.
     /// • '?' = unknown word, brute-forced from full BIP-39 list.
+    /// • "word" (in literal double quotes) = pinned: kept at its position,
+    ///   excluded from permutation, even without --keep-word-order.
     ///
     /// EXAMPLE
-    ///   zebra,liquid,tornado,?   abandon,art   <- slot 1 (2 alternatives)
-    ///   orbit,galaxy                           <- slot 2
-    ///   venture,sun                            <- slot 3
+    ///   zebra,"tornado",gravity,?   abandon,art   <- slot 1 (2 alternatives)
+    ///   orbit,galaxy                               <- slot 2
+    ///   venture,sun                                <- slot 3
+    /// (in alt 1: tornado stays 2nd; zebra/gravity permute; last word brute-forced)
     ///
     /// Total words across chosen slots must equal 12.
     #[arg(long, value_name = "FILE")]
@@ -61,7 +67,9 @@ struct Args {
     #[arg(long)]
     keep_token_order: bool,
 
-    /// Keep word order within each slot (no intra-slot permutations).
+    /// Keep word order within each slot (tokenlist mode; no intra-slot
+    /// permutations). Not used in word mode — there, pin individual words
+    /// with literal double quotes instead (see the positional args above).
     #[arg(long)]
     keep_word_order: bool,
 
@@ -115,11 +123,25 @@ struct Args {
 #[derive(Debug, Clone)]
 enum Token {
     Word(String),
+    /// A word wrapped in literal double quotes, e.g. `"tornado"` — kept at
+    /// its position, excluded from permutation (unless --keep-word-order
+    /// already made permutation a no-op).
+    PinnedWord(String),
     Missing,
 }
 
 type Alternative = Vec<Token>;
 type Slot        = Vec<Alternative>;
+
+/// A word wrapped in literal double quotes (`"..."`, length >= 2) marks it
+/// pinned. Shared by tokenlist parsing and word-mode CLI args.
+fn is_pinned_token(s: &str) -> bool {
+    s.len() >= 2 && s.starts_with('"') && s.ends_with('"')
+}
+
+fn strip_pin(s: &str) -> &str {
+    if is_pinned_token(s) { &s[1..s.len() - 1] } else { s }
+}
 
 // ---------------------------------------------------------------------------
 // Coin / Target
@@ -343,10 +365,15 @@ fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
             .map(|alt_str| {
                 alt_str.split(',')
                     .filter(|t| !t.is_empty())
-                    .map(|t| if t.trim() == "?" {
-                        Token::Missing
-                    } else {
-                        Token::Word(t.trim().to_string())
+                    .map(|t| {
+                        let t = t.trim();
+                        if t == "?" {
+                            Token::Missing
+                        } else if is_pinned_token(t) {
+                            Token::PinnedWord(strip_pin(t).to_string())
+                        } else {
+                            Token::Word(t.to_string())
+                        }
                     })
                     .collect::<Alternative>()
             })
@@ -370,7 +397,7 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
     for (si, slot) in slots.iter().enumerate() {
         for (ai, alt) in slot.iter().enumerate() {
             for tok in alt {
-                if let Token::Word(w) = tok {
+                if let Token::Word(w) | Token::PinnedWord(w) = tok {
                     anyhow::ensure!(
                         wl.contains(&w.as_str()),
                         "Slot {}, alt {}: '{}' not in BIP-39 wordlist", si+1, ai+1, w
@@ -389,16 +416,18 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
 fn expand_alternative(
     alt: &Alternative,
     wordlist: &'static [&'static str],
-) -> (Vec<u16>, Vec<usize>) {
-    let mut known: Vec<u16>   = Vec::new();
-    let mut miss:  Vec<usize> = Vec::new();
+) -> (Vec<u16>, Vec<(usize, u16)>, Vec<usize>) {
+    let mut movable: Vec<u16>       = Vec::new();
+    let mut pinned:  Vec<(usize, u16)> = Vec::new();
+    let mut miss:    Vec<usize>     = Vec::new();
     for (i, tok) in alt.iter().enumerate() {
         match tok {
-            Token::Word(w) => known.push(wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16),
-            Token::Missing => miss.push(i),
+            Token::Word(w)       => movable.push(wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16),
+            Token::PinnedWord(w) => pinned.push((i, wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16)),
+            Token::Missing       => miss.push(i),
         }
     }
-    (known, miss)
+    (movable, pinned, miss)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,26 +435,29 @@ fn expand_alternative(
 // ---------------------------------------------------------------------------
 
 fn slot_candidates(
-    known: &[u16],
-    miss:  &[usize],
+    movable: &[u16],
+    pinned:  &[(usize, u16)],
+    miss:    &[usize],
     total_len: usize,
     keep_word_order: bool,
     wl_len: usize,
 ) -> Vec<Vec<u16>> {
-    let known_perms: Vec<Vec<u16>> = if keep_word_order {
-        vec![known.to_vec()]
+    let movable_perms: Vec<Vec<u16>> = if keep_word_order {
+        vec![movable.to_vec()]
     } else {
-        known.iter().copied().permutations(known.len()).collect()
+        movable.iter().copied().permutations(movable.len()).collect()
     };
 
     let mut out = Vec::new();
-    for kp in &known_perms {
+    for kp in &movable_perms {
         for mv in missing_combos(wl_len as u16, miss.len()) {
-            let mut seq = Vec::with_capacity(total_len);
+            let mut seq = vec![0u16; total_len];
+            for &(pos, w) in pinned { seq[pos] = w; }
             let (mut ki, mut mi) = (0, 0);
             for pos in 0..total_len {
-                if miss.contains(&pos) { seq.push(mv[mi]); mi += 1; }
-                else                   { seq.push(kp[ki]); ki += 1; }
+                if pinned.iter().any(|&(p, _)| p == pos) { continue; }
+                if miss.contains(&pos) { seq[pos] = mv[mi]; mi += 1; }
+                else                   { seq[pos] = kp[ki]; ki += 1; }
             }
             out.push(seq);
         }
@@ -474,8 +506,8 @@ impl LazyPhraseIter {
 
         let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen.iter().map(|slot| {
             slot.iter().map(|alt| {
-                let (known, miss) = expand_alternative(alt, wordlist);
-                slot_candidates(&known, &miss, alt.len(), keep_word_order, wl_len)
+                let (movable, pinned, miss) = expand_alternative(alt, wordlist);
+                slot_candidates(&movable, &pinned, &miss, alt.len(), keep_word_order, wl_len)
             }).collect()
         }).collect();
 
@@ -910,23 +942,29 @@ fn run_word_gpu(
     let batch_size = args.batch_size.unwrap_or_else(||
         probe_batch_size(&gpu_handle, &gpu_wl, &h160, args.min_batch, args.max_batch, pipeline));
 
+    let (owned, pinned_idx) = split_pinned_words(&args.words);
+
     let mut known_idx: Vec<u16> = Vec::new();
-    for w in &args.words {
+    for w in &owned {
         let pos = wordlist.iter().position(|x| *x == w.as_str())
             .with_context(|| format!("'{w}' not in BIP-39 wordlist"))?;
         known_idx.push(pos as u16);
     }
 
-    let missing = 12 - args.words.len();
-    let total   = total_candidates(args.words.len(), wordlist.len(), missing);
+    let missing = 12 - owned.len();
+    let total   = word_mode_total(owned.len(), owned.len() - pinned_idx.len(), wordlist.len(), missing);
 
     println!("Using GPU (CUDA) — word mode — batch {}", format_number(batch_size));
+    if !pinned_idx.is_empty() {
+        let pinned_words: Vec<&str> = pinned_idx.iter().map(|&i| owned[i].as_str()).collect();
+        println!("Pinned in place (not permuted): {}", pinned_words.join(", "));
+    }
     if missing > 0 {
         println!("Completing {missing} missing word(s) from {} BIP-39 words.", wordlist.len());
     }
     println!("Total candidates: {}", format_number(total));
 
-    let cand_iter = candidates::stream(known_idx, wordlist.len());
+    let cand_iter = candidates::stream(known_idx, pinned_idx.clone(), wordlist.len());
     let prog_iter = ProgressIter::new(cand_iter, Some(total), 100_000);
 
     let t   = Instant::now();
@@ -939,7 +977,7 @@ fn run_word_gpu(
             let phrase: Vec<&str> = h.indices.iter().map(|&i| wordlist[i as usize]).collect();
             let phrase_str = phrase.join(" ");
             if missing > 0 {
-                println!("Recovered : {}", recovered_words(&args.words, &phrase_str).join(" "));
+                println!("Recovered : {}", recovered_words(&owned, &phrase_str).join(" "));
             }
             println!("Mnemonic  : {}", phrase_str);
             println!("Index     : {}", h.global_index);
@@ -978,10 +1016,15 @@ fn run_word_cpu(
     let target_disp = target.as_display_string();
     let secp = Arc::new(Secp256k1::new());
 
-    let missing = 12 - args.words.len();
-    let total   = total_candidates(args.words.len(), wordlist.len(), missing);
+    let (owned, pinned_idx) = split_pinned_words(&args.words);
+    let missing = 12 - owned.len();
+    let total   = word_mode_total(owned.len(), owned.len() - pinned_idx.len(), wordlist.len(), missing);
 
     println!("Using CPU ({num_threads} threads) — word mode");
+    if !pinned_idx.is_empty() {
+        let pinned_words: Vec<&str> = pinned_idx.iter().map(|&i| owned[i].as_str()).collect();
+        println!("Pinned in place (not permuted): {}", pinned_words.join(", "));
+    }
     if missing > 0 {
         println!("Completing {missing} missing word(s) from {} BIP-39 words.", wordlist.len());
     }
@@ -993,9 +1036,7 @@ fn run_word_cpu(
     let found_index  = Arc::new(AtomicUsize::new(0));
     let start        = Instant::now();
 
-    let owned: Vec<String> = args.words.to_vec();
-    let candidates = owned.into_iter()
-        .permutations(args.words.len())
+    let candidates = pinned_permutations(&owned, &pinned_idx)
         .flat_map(move |base| insert_missing(base, missing, wordlist).map(|v| v.join(" ")));
 
     candidates.par_bridge().for_each(|phrase| {
@@ -1055,7 +1096,7 @@ fn run_word_cpu(
         let fp  = found_phrase.lock().unwrap();
         let idx = found_index.load(Ordering::SeqCst);
         if missing > 0 {
-            println!("Recovered : {}", recovered_words(&args.words, &fp).join(" "));
+            println!("Recovered : {}", recovered_words(&owned, &fp).join(" "));
         }
         println!("Mnemonic  : {}", *fp);
         println!("Index     : {idx}");
@@ -1086,8 +1127,67 @@ fn p2pkh_hash160(addr: &Address<NetworkChecked>) -> Result<[u8; 20]> {
     }
 }
 
-fn total_candidates(n: usize, wl_len: usize, missing: usize) -> usize {
-    (1..=n).product::<usize>().max(1) * wl_len.pow(missing as u32)
+/// Exact size of the word-mode candidate space actually generated by
+/// `pinned_permutations`/`candidates::stream` + `insert_missing`.
+///
+/// `insert_missing` doesn't drop each missing word into one fixed slot — it
+/// tries every gap of the growing sequence, so each of the `missing` words
+/// contributes an extra positional factor, not just a `wl_len` value factor.
+/// For a known-word count `n` (movable + pinned) and `missing = 12 - n`,
+/// that positional factor is `(n+1)(n+2)...(n+missing) == 12!/n!`.
+fn word_mode_total(n: usize, movable: usize, wl_len: usize, missing: usize) -> usize {
+    let perm_count = factorial(movable);
+    let insertion_positions: usize = ((n + 1)..=(n + missing)).product::<usize>().max(1);
+    perm_count * insertion_positions * wl_len.pow(missing as u32)
+}
+
+fn factorial(n: usize) -> usize {
+    (1..=n).product::<usize>().max(1)
+}
+
+/// Splits word-mode words into (unquoted words, indices of pinned ones).
+/// A word wrapped in literal double quotes (e.g. `"tornado"`) is pinned.
+fn split_pinned_words(words: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut out    = Vec::with_capacity(words.len());
+    let mut pinned = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if is_pinned_token(w) {
+            out.push(strip_pin(w).to_string());
+            pinned.push(i);
+        } else {
+            out.push(w.clone());
+        }
+    }
+    (out, pinned)
+}
+
+/// Permutations of `words` that keep the entries at `pinned` indices fixed
+/// in place, permuting only the rest. With no pinned indices this is the
+/// same as a full permutation of every word.
+fn pinned_permutations(
+    words:  &[String],
+    pinned: &[usize],
+) -> Box<dyn Iterator<Item = Vec<String>> + Send> {
+    let n = words.len();
+    let pinned_set: HashSet<usize> = pinned.iter().copied().collect();
+    let pinned_vals: Vec<(usize, String)> = pinned.iter().map(|&i| (i, words[i].clone())).collect();
+    let movable: Vec<String> = words.iter().enumerate()
+        .filter(|(i, _)| !pinned_set.contains(i))
+        .map(|(_, w)| w.clone())
+        .collect();
+    let movable_len = movable.len();
+
+    Box::new(movable.into_iter().permutations(movable_len).map(move |perm| {
+        let mut out = vec![String::new(); n];
+        for (i, w) in &pinned_vals { out[*i] = w.clone(); }
+        let mut mi = 0;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if pinned_set.contains(&i) { continue; }
+            *slot = perm[mi].clone();
+            mi += 1;
+        }
+        out
+    }))
 }
 
 fn insert_missing(
