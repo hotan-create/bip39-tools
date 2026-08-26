@@ -49,15 +49,20 @@ struct Args {
     /// • Blank lines and '#' comments are ignored.
     /// • Alternatives within a line separated by whitespace.
     /// • Words within an alternative separated by commas.
-    /// • '?' = unknown word, brute-forced from full BIP-39 list.
+    /// • '?' = unknown word, brute-forced from full BIP-39 list. Its
+    ///   *position* is permuted along with the known words too (unless
+    ///   --keep-word-order), so you don't need one alternative per '?' slot.
     /// • "word" (in literal double quotes) = pinned: kept at its position,
     ///   excluded from permutation, even without --keep-word-order.
+    /// • "?" (literal double quotes around '?') = unknown word whose
+    ///   *position* is pinned, but the value is still brute-forced.
     ///
     /// EXAMPLE
     ///   zebra,"tornado",gravity,?   abandon,art   <- slot 1 (2 alternatives)
     ///   orbit,galaxy                               <- slot 2
     ///   venture,sun                                <- slot 3
-    /// (in alt 1: tornado stays 2nd; zebra/gravity permute; last word brute-forced)
+    /// (in alt 1: tornado stays 2nd; zebra/gravity/? all permute among the
+    ///  other 3 positions — no need to write '?' in every possible slot)
     ///
     /// Total words across chosen slots must equal 12.
     #[arg(long, value_name = "FILE")]
@@ -127,7 +132,13 @@ enum Token {
     /// its position, excluded from permutation (unless --keep-word-order
     /// already made permutation a no-op).
     PinnedWord(String),
+    /// `?` — unknown word, brute-forced from the full wordlist. By default
+    /// its *position* is also permuted along with the known words (so you
+    /// don't have to write out one alternative per possible '?' slot).
     Missing,
+    /// `"?"` — unknown word whose *position* is pinned (kept exactly where
+    /// written), but the value is still brute-forced.
+    PinnedMissing,
 }
 
 type Alternative = Vec<Token>;
@@ -370,7 +381,11 @@ fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
                         if t == "?" {
                             Token::Missing
                         } else if is_pinned_token(t) {
-                            Token::PinnedWord(strip_pin(t).to_string())
+                            if strip_pin(t) == "?" {
+                                Token::PinnedMissing
+                            } else {
+                                Token::PinnedWord(strip_pin(t).to_string())
+                            }
                         } else {
                             Token::Word(t.to_string())
                         }
@@ -410,73 +425,185 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Expand one alternative → (known_word_indices, missing_positions)
+// AltMeta / nth_permutation / nth_combination / nth_missing_combo: lazily
+// materialize one alternative's partial phrase for a given flat candidate
+// index — O(len) or O(len^2), never materializing the other permutations,
+// combinations, or wl_len^k combos upfront.
 // ---------------------------------------------------------------------------
 
-fn expand_alternative(
-    alt: &Alternative,
-    wordlist: &'static [&'static str],
-) -> (Vec<u16>, Vec<(usize, u16)>, Vec<usize>) {
-    let mut movable: Vec<u16>       = Vec::new();
-    let mut pinned:  Vec<(usize, u16)> = Vec::new();
-    let mut miss:    Vec<usize>     = Vec::new();
-    for (i, tok) in alt.iter().enumerate() {
-        match tok {
-            Token::Word(w)       => movable.push(wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16),
-            Token::PinnedWord(w) => pinned.push((i, wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16)),
-            Token::Missing       => miss.push(i),
-        }
-    }
-    (movable, pinned, miss)
-}
-
-// ---------------------------------------------------------------------------
-// slot_candidates: expand one alternative into Vec<Vec<u16>> of partial phrases
-// ---------------------------------------------------------------------------
-
-fn slot_candidates(
-    movable: &[u16],
-    pinned:  &[(usize, u16)],
-    miss:    &[usize],
-    total_len: usize,
-    keep_word_order: bool,
-    wl_len: usize,
-) -> Vec<Vec<u16>> {
-    let movable_perms: Vec<Vec<u16>> = if keep_word_order {
-        vec![movable.to_vec()]
-    } else {
-        movable.iter().copied().permutations(movable.len()).collect()
-    };
-
-    let mut out = Vec::new();
-    for kp in &movable_perms {
-        for mv in missing_combos(wl_len as u16, miss.len()) {
-            let mut seq = vec![0u16; total_len];
-            for &(pos, w) in pinned { seq[pos] = w; }
-            let (mut ki, mut mi) = (0, 0);
-            for pos in 0..total_len {
-                if pinned.iter().any(|&(p, _)| p == pos) { continue; }
-                if miss.contains(&pos) { seq[pos] = mv[mi]; mi += 1; }
-                else                   { seq[pos] = kp[ki]; ki += 1; }
-            }
-            out.push(seq);
-        }
+/// The `idx`-th (0-based) permutation of `items`, via the factorial number
+/// system (Lehmer code). O(n^2) worst case (n small in practice: <=12).
+fn nth_permutation(items: &[u16], mut idx: usize) -> Vec<u16> {
+    let mut pool: Vec<u16> = items.to_vec();
+    let n = pool.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let f   = factorial(n - 1 - i);
+        let sel = idx / f;
+        idx %= f;
+        out.push(pool.remove(sel));
     }
     out
 }
 
-/// Yield all n^k combinations with replacement (k indices from 0..n).
-fn missing_combos(n: u16, k: usize) -> Vec<Vec<u16>> {
-    if k == 0 { return vec![vec![]]; }
-    let mut result = Vec::new();
-    let sub = missing_combos(n, k - 1);
-    for i in 0..n {
-        for mut s in sub.clone() {
-            s.insert(0, i);
-            result.push(s);
+fn binomial(n: usize, k: usize) -> usize {
+    if k > n { return 0; }
+    let k = k.min(n - k);
+    let mut result: usize = 1;
+    for i in 0..k {
+        result = result * (n - i) / (i + 1);
+    }
+    result
+}
+
+/// The `idx`-th (0-based, lexicographic) k-combination of {0, ..., n-1},
+/// via the combinatorial number system. O(n*k) worst case (n, k small).
+fn nth_combination(n: usize, k: usize, mut idx: usize) -> Vec<usize> {
+    let mut result = Vec::with_capacity(k);
+    let mut start = 0usize;
+    for i in 0..k {
+        let remaining = k - i - 1;
+        let mut c = start;
+        loop {
+            let cnt = binomial(n - c - 1, remaining);
+            if idx < cnt {
+                result.push(c);
+                start = c + 1;
+                break;
+            }
+            idx -= cnt;
+            c += 1;
         }
     }
     result
+}
+
+/// The `idx`-th (0-based) of the `wl_len^k` combinations-with-replacement,
+/// as a k-digit base-`wl_len` number.
+fn nth_missing_combo(wl_len: u16, k: usize, mut idx: usize) -> Vec<u16> {
+    let mut out = vec![0u16; k];
+    for i in (0..k).rev() {
+        out[i] = (idx % wl_len as usize) as u16;
+        idx /= wl_len as usize;
+    }
+    out
+}
+
+/// Per-alternative metadata: enough to compute the `idx`-th candidate word
+/// sequence on demand, without ever generating the other candidates for
+/// this alternative. This is what makes `LazyPhraseIter` actually lazy —
+/// previously this was a fully-materialized `Vec<Vec<u16>>` per
+/// alternative, which meant e.g. 20,000 alternatives x 7! permutations
+/// each had to be built and held in RAM before the search could start.
+///
+/// Four kinds of token, per position:
+///   Word          — movable: known value, position permutes freely
+///   Missing (?)   — movable: unknown value (brute-forced), position also
+///                   permutes freely (mixed in with the known words)
+///   PinnedWord    — fixed position AND value
+///   PinnedMissing (") — fixed position, unknown value (still brute-forced)
+///
+/// The `m` known movable words and `q` movable '?' marks are permuted
+/// together as one multiset of `m+q` slots (the '?' marks are
+/// interchangeable among themselves for *position* purposes — each still
+/// gets its own independently brute-forced value).
+struct AltMeta {
+    total_len:         usize,
+    pinned_fixed:      Vec<(usize, u16)>,
+    pinned_missing:    Vec<usize>,
+    movable_known:     Vec<u16>,     // in original relative order
+    movable_positions: Vec<usize>,   // the m+q position indices (ascending)
+    movable_is_missing: Vec<bool>,   // original layout of those m+q slots (used by --keep-word-order)
+    movable_missing:   usize,        // q
+    known_perm_count:  usize,        // m!
+    perm_count:        usize,        // C(m+q, q) * m!  (or 1 with --keep-word-order)
+    combo_count:       usize,        // wl_len ^ (q + pinned_missing.len())
+}
+
+impl AltMeta {
+    fn new(alt: &Alternative, wordlist: &'static [&'static str], wl_len: usize, keep_word_order: bool) -> Self {
+        let mut pinned_fixed:       Vec<(usize, u16)> = Vec::new();
+        let mut pinned_missing:     Vec<usize> = Vec::new();
+        let mut movable_known:      Vec<u16> = Vec::new();
+        let mut movable_positions:  Vec<usize> = Vec::new();
+        let mut movable_is_missing: Vec<bool> = Vec::new();
+
+        for (i, tok) in alt.iter().enumerate() {
+            match tok {
+                Token::Word(w) => {
+                    movable_known.push(wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16);
+                    movable_positions.push(i);
+                    movable_is_missing.push(false);
+                }
+                Token::Missing => {
+                    movable_positions.push(i);
+                    movable_is_missing.push(true);
+                }
+                Token::PinnedWord(w) => pinned_fixed.push((i, wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16)),
+                Token::PinnedMissing => pinned_missing.push(i),
+            }
+        }
+
+        let m = movable_known.len();
+        let q = movable_is_missing.iter().filter(|&&is_q| is_q).count();
+        let known_perm_count = if keep_word_order { 1 } else { factorial(m) };
+        let perm_count = if keep_word_order { 1 } else { binomial(m + q, q) * known_perm_count };
+        let combo_count = wl_len.pow((q + pinned_missing.len()) as u32).max(1);
+
+        AltMeta {
+            total_len: alt.len(),
+            pinned_fixed, pinned_missing,
+            movable_known, movable_positions, movable_is_missing,
+            movable_missing: q,
+            known_perm_count, perm_count, combo_count,
+        }
+    }
+
+    fn total(&self) -> usize { self.perm_count * self.combo_count }
+
+    fn build(&self, wl_len: usize, keep_word_order: bool, idx: usize) -> Vec<u16> {
+        let perm_idx  = idx / self.combo_count;
+        let combo_idx = idx % self.combo_count;
+
+        let m = self.movable_known.len();
+        let q = self.movable_missing;
+
+        // qpos: which of the m+q movable *slots* (0-based, indexing into
+        // movable_positions) hold a '?'. known_order: the known words, in
+        // the order they fill the remaining movable slots.
+        let (qpos, known_order): (Vec<usize>, Vec<u16>) = if keep_word_order {
+            let qpos: Vec<usize> = self.movable_is_missing.iter().enumerate()
+                .filter(|(_, &is_q)| is_q).map(|(i, _)| i).collect();
+            (qpos, self.movable_known.clone())
+        } else {
+            let combo_sel_idx  = perm_idx / self.known_perm_count;
+            let known_perm_idx = perm_idx % self.known_perm_count;
+            (nth_combination(m + q, q, combo_sel_idx), nth_permutation(&self.movable_known, known_perm_idx))
+        };
+        let qpos_set: HashSet<usize> = qpos.iter().copied().collect();
+
+        // First q unknown values go to the movable '?' slots (left to
+        // right); the rest go to the pinned-missing slots (position order).
+        let unknown_vals = nth_missing_combo(wl_len as u16, q + self.pinned_missing.len(), combo_idx);
+
+        let mut seq = vec![0u16; self.total_len];
+        for &(pos, w) in &self.pinned_fixed { seq[pos] = w; }
+
+        let (mut ki, mut qi) = (0, 0);
+        for (slot_i, &pos) in self.movable_positions.iter().enumerate() {
+            if qpos_set.contains(&slot_i) {
+                seq[pos] = unknown_vals[qi];
+                qi += 1;
+            } else {
+                seq[pos] = known_order[ki];
+                ki += 1;
+            }
+        }
+        for (i, &pos) in self.pinned_missing.iter().enumerate() {
+            seq[pos] = unknown_vals[q + i];
+        }
+        seq
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,14 +611,16 @@ fn missing_combos(n: u16, k: usize) -> Vec<Vec<u16>> {
 // ---------------------------------------------------------------------------
 
 struct LazyPhraseIter {
-    /// [slot][alt][cand_idx] = partial Vec<u16>
-    slot_alts:   Vec<Vec<Vec<Vec<u16>>>>,
-    slot_orders: Vec<Vec<usize>>,
-    order_pos:   usize,
-    alt_idx:     Vec<usize>,
-    cand_idx:    Vec<usize>,
-    first:       bool,
-    done:        bool,
+    /// [slot][alt] = metadata (candidates computed on demand, not stored)
+    slot_alts:       Vec<Vec<AltMeta>>,
+    slot_orders:     Vec<Vec<usize>>,
+    order_pos:       usize,
+    alt_idx:         Vec<usize>,
+    cand_idx:        Vec<usize>,
+    wl_len:          usize,
+    keep_word_order: bool,
+    first:           bool,
+    done:            bool,
 }
 
 impl LazyPhraseIter {
@@ -504,11 +633,8 @@ impl LazyPhraseIter {
         let n      = chosen.len();
         let wl_len = wordlist.len();
 
-        let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen.iter().map(|slot| {
-            slot.iter().map(|alt| {
-                let (movable, pinned, miss) = expand_alternative(alt, wordlist);
-                slot_candidates(&movable, &pinned, &miss, alt.len(), keep_word_order, wl_len)
-            }).collect()
+        let slot_alts: Vec<Vec<AltMeta>> = chosen.iter().map(|slot| {
+            slot.iter().map(|alt| AltMeta::new(alt, wordlist, wl_len, keep_word_order)).collect()
         }).collect();
 
         let slot_orders: Vec<Vec<usize>> = if keep_token_order || n <= 1 {
@@ -524,6 +650,8 @@ impl LazyPhraseIter {
             order_pos: 0,
             alt_idx:   vec![0; num],
             cand_idx:  vec![0; num],
+            wl_len,
+            keep_word_order,
             first: true,
             done:  num == 0,
         }
@@ -533,9 +661,10 @@ impl LazyPhraseIter {
         let mut phrase = [0u16; 12];
         let mut off = 0usize;
         for &si in order {
-            let words = &self.slot_alts[si][self.alt_idx[si]][self.cand_idx[si]];
+            let meta  = &self.slot_alts[si][self.alt_idx[si]];
+            let words = meta.build(self.wl_len, self.keep_word_order, self.cand_idx[si]);
             if off + words.len() > 12 { return None; }
-            phrase[off..off+words.len()].copy_from_slice(words);
+            phrase[off..off+words.len()].copy_from_slice(&words);
             off += words.len();
         }
         if off == 12 { Some(phrase) } else { None }
@@ -547,7 +676,7 @@ impl LazyPhraseIter {
         while pos >= 0 {
             let si = order[pos as usize];
             self.cand_idx[si] += 1;
-            if self.cand_idx[si] < self.slot_alts[si][self.alt_idx[si]].len() { return true; }
+            if self.cand_idx[si] < self.slot_alts[si][self.alt_idx[si]].total() { return true; }
             self.cand_idx[si] = 0;
             self.alt_idx[si] += 1;
             if self.alt_idx[si] < self.slot_alts[si].len() { return true; }
