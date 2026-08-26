@@ -431,19 +431,25 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
 // combinations, or wl_len^k combos upfront.
 // ---------------------------------------------------------------------------
 
-/// The `idx`-th (0-based) permutation of `items`, via the factorial number
-/// system (Lehmer code). O(n^2) worst case (n small in practice: <=12).
-fn nth_permutation(items: &[u16], mut idx: usize) -> Vec<u16> {
-    let mut pool: Vec<u16> = items.to_vec();
-    let n = pool.len();
-    let mut out = Vec::with_capacity(n);
+/// The `idx`-th (0-based) permutation of `items` (len <= 12), written into
+/// `out[..items.len()]` — via the factorial number system (Lehmer code).
+/// No heap allocation: everything lives in a fixed 12-slot stack buffer,
+/// since this runs once per generated candidate (millions/sec on a fast
+/// GPU) and a Vec alloc per call was enough to make CPU-side generation the
+/// bottleneck instead of the GPU kernel.
+fn nth_permutation_into(items: &[u16], mut idx: usize, out: &mut [u16]) {
+    let n = items.len();
+    let mut pool = [0u16; 12];
+    pool[..n].copy_from_slice(items);
+    let mut len = n;
     for i in 0..n {
         let f   = factorial(n - 1 - i);
         let sel = idx / f;
         idx %= f;
-        out.push(pool.remove(sel));
+        out[i] = pool[sel];
+        for j in sel..len - 1 { pool[j] = pool[j + 1]; }
+        len -= 1;
     }
-    out
 }
 
 fn binomial(n: usize, k: usize) -> usize {
@@ -456,10 +462,10 @@ fn binomial(n: usize, k: usize) -> usize {
     result
 }
 
-/// The `idx`-th (0-based, lexicographic) k-combination of {0, ..., n-1},
-/// via the combinatorial number system. O(n*k) worst case (n, k small).
-fn nth_combination(n: usize, k: usize, mut idx: usize) -> Vec<usize> {
-    let mut result = Vec::with_capacity(k);
+/// The `idx`-th (0-based, lexicographic) k-combination of {0, ..., n-1}
+/// (k <= 12), written into `out[..k]`. Via the combinatorial number system,
+/// O(n*k) worst case (n, k small) — no heap allocation.
+fn nth_combination_into(n: usize, k: usize, mut idx: usize, out: &mut [usize]) {
     let mut start = 0usize;
     for i in 0..k {
         let remaining = k - i - 1;
@@ -467,7 +473,7 @@ fn nth_combination(n: usize, k: usize, mut idx: usize) -> Vec<usize> {
         loop {
             let cnt = binomial(n - c - 1, remaining);
             if idx < cnt {
-                result.push(c);
+                out[i] = c;
                 start = c + 1;
                 break;
             }
@@ -475,18 +481,16 @@ fn nth_combination(n: usize, k: usize, mut idx: usize) -> Vec<usize> {
             c += 1;
         }
     }
-    result
 }
 
-/// The `idx`-th (0-based) of the `wl_len^k` combinations-with-replacement,
-/// as a k-digit base-`wl_len` number.
-fn nth_missing_combo(wl_len: u16, k: usize, mut idx: usize) -> Vec<u16> {
-    let mut out = vec![0u16; k];
+/// The `idx`-th (0-based) of the `wl_len^k` combinations-with-replacement
+/// (k <= 12), as a k-digit base-`wl_len` number written into `out[..k]` —
+/// no heap allocation.
+fn nth_missing_combo_into(wl_len: u16, k: usize, mut idx: usize, out: &mut [u16]) {
     for i in (0..k).rev() {
         out[i] = (idx % wl_len as usize) as u16;
         idx /= wl_len as usize;
     }
-    out
 }
 
 /// Per-alternative metadata: enough to compute the `idx`-th candidate word
@@ -561,48 +565,60 @@ impl AltMeta {
 
     fn total(&self) -> usize { self.perm_count * self.combo_count }
 
-    fn build(&self, wl_len: usize, keep_word_order: bool, idx: usize) -> Vec<u16> {
+    /// Write the `idx`-th candidate for this alternative into `out`
+    /// (`out.len() == self.total_len`). Zero heap allocations — this runs
+    /// once per generated candidate (potentially tens of millions per
+    /// second feeding a fast GPU), so it stays on the stack throughout.
+    fn build_into(&self, wl_len: usize, keep_word_order: bool, idx: usize, out: &mut [u16]) {
         let perm_idx  = idx / self.combo_count;
         let combo_idx = idx % self.combo_count;
 
         let m = self.movable_known.len();
         let q = self.movable_missing;
 
-        // qpos: which of the m+q movable *slots* (0-based, indexing into
-        // movable_positions) hold a '?'. known_order: the known words, in
-        // the order they fill the remaining movable slots.
-        let (qpos, known_order): (Vec<usize>, Vec<u16>) = if keep_word_order {
-            let qpos: Vec<usize> = self.movable_is_missing.iter().enumerate()
-                .filter(|(_, &is_q)| is_q).map(|(i, _)| i).collect();
-            (qpos, self.movable_known.clone())
+        // qpos_mask[i] = slot i (0-based, indexing into movable_positions)
+        // holds a '?'. known_order[..m] = the known words, in the order
+        // they fill the remaining movable slots.
+        let mut qpos_mask   = [false; 12];
+        let mut known_order = [0u16; 12];
+
+        if keep_word_order {
+            for (i, &is_q) in self.movable_is_missing.iter().enumerate() {
+                qpos_mask[i] = is_q;
+            }
+            known_order[..m].copy_from_slice(&self.movable_known);
         } else {
             let combo_sel_idx  = perm_idx / self.known_perm_count;
             let known_perm_idx = perm_idx % self.known_perm_count;
-            (nth_combination(m + q, q, combo_sel_idx), nth_permutation(&self.movable_known, known_perm_idx))
-        };
-        let qpos_set: HashSet<usize> = qpos.iter().copied().collect();
+
+            let mut qpos_buf = [0usize; 12];
+            nth_combination_into(m + q, q, combo_sel_idx, &mut qpos_buf[..q]);
+            for &p in &qpos_buf[..q] { qpos_mask[p] = true; }
+
+            nth_permutation_into(&self.movable_known, known_perm_idx, &mut known_order[..m]);
+        }
 
         // First q unknown values go to the movable '?' slots (left to
         // right); the rest go to the pinned-missing slots (position order).
-        let unknown_vals = nth_missing_combo(wl_len as u16, q + self.pinned_missing.len(), combo_idx);
+        let unknown_len = q + self.pinned_missing.len();
+        let mut unknown_vals = [0u16; 12];
+        nth_missing_combo_into(wl_len as u16, unknown_len, combo_idx, &mut unknown_vals[..unknown_len]);
 
-        let mut seq = vec![0u16; self.total_len];
-        for &(pos, w) in &self.pinned_fixed { seq[pos] = w; }
+        for &(pos, w) in &self.pinned_fixed { out[pos] = w; }
 
         let (mut ki, mut qi) = (0, 0);
         for (slot_i, &pos) in self.movable_positions.iter().enumerate() {
-            if qpos_set.contains(&slot_i) {
-                seq[pos] = unknown_vals[qi];
+            if qpos_mask[slot_i] {
+                out[pos] = unknown_vals[qi];
                 qi += 1;
             } else {
-                seq[pos] = known_order[ki];
+                out[pos] = known_order[ki];
                 ki += 1;
             }
         }
         for (i, &pos) in self.pinned_missing.iter().enumerate() {
-            seq[pos] = unknown_vals[q + i];
+            out[pos] = unknown_vals[q + i];
         }
-        seq
     }
 }
 
@@ -661,11 +677,10 @@ impl LazyPhraseIter {
         let mut phrase = [0u16; 12];
         let mut off = 0usize;
         for &si in order {
-            let meta  = &self.slot_alts[si][self.alt_idx[si]];
-            let words = meta.build(self.wl_len, self.keep_word_order, self.cand_idx[si]);
-            if off + words.len() > 12 { return None; }
-            phrase[off..off+words.len()].copy_from_slice(&words);
-            off += words.len();
+            let meta = &self.slot_alts[si][self.alt_idx[si]];
+            if off + meta.total_len > 12 { return None; }
+            meta.build_into(self.wl_len, self.keep_word_order, self.cand_idx[si], &mut phrase[off..off + meta.total_len]);
+            off += meta.total_len;
         }
         if off == 12 { Some(phrase) } else { None }
     }
