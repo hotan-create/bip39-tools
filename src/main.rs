@@ -52,6 +52,13 @@ struct Args {
     /// • '?' = unknown word, brute-forced from full BIP-39 list.
     /// • "word" (in literal double quotes) = pinned: kept at its position,
     ///   excluded from permutation, even without --keep-word-order.
+    /// • A line may start with an integer, e.g. "4 fiber" — this fixes the
+    ///   slot at absolute position 4 (1-indexed) of the final phrase. Only
+    ///   effective when --keep-token-order is NOT set (it already fixes
+    ///   every slot's position). A slot with a fixed position must be a
+    ///   single word/'?' per alternative (no multi-word alternatives).
+    ///   Slots without a leading number keep permuting freely across
+    ///   whatever positions are left.
     ///
     /// EXAMPLE
     ///   zebra,"tornado",gravity,?   abandon,art   <- slot 1 (2 alternatives)
@@ -59,11 +66,19 @@ struct Args {
     ///   venture,sun                                <- slot 3
     /// (in alt 1: tornado stays 2nd; zebra/gravity permute; last word brute-forced)
     ///
+    /// EXAMPLE (fixed positions, rest permutes freely)
+    ///   1 dutch          <- word 1 of the phrase is fixed to "dutch"
+    ///   4 fiber          <- word 4 is fixed to "fiber"
+    ///   ?                <- an unpinned slot, brute-forced, goes anywhere left
+    ///   fork sponsor     <- an unpinned slot: alt "fork" or alt "sponsor"
+    ///
     /// Total words across chosen slots must equal 12.
     #[arg(long, value_name = "FILE")]
     tokenlist: Option<PathBuf>,
 
-    /// Keep slot order as written (no slot permutations).
+    /// Keep slot order as written (no slot permutations). This also fixes
+    /// every slot's absolute position to its line order, so any explicit
+    /// position numbers in the tokenlist must already match that order.
     #[arg(long)]
     keep_token_order: bool,
 
@@ -73,8 +88,10 @@ struct Args {
     #[arg(long)]
     keep_word_order: bool,
 
-    /// Minimum number of slots to use (default: all).
-    #[arg(long, value_name = "N")]
+    /// Minimum number of slots to use (default: all). Slots with an
+    /// explicit fixed position (see --tokenlist) always count toward this
+    /// and are always included; this only trims down the unpositioned ones.
+    #[arg(long, alias = "min-tokens", value_name = "N")]
     min_token: Option<usize>,
 
     /// BIP-39 wordlist language.
@@ -133,6 +150,15 @@ enum Token {
 type Alternative = Vec<Token>;
 type Slot        = Vec<Alternative>;
 
+/// One parsed tokenlist line: its alternatives, plus an optional explicit
+/// absolute position (1-indexed) in the final 12-word phrase, set by a
+/// leading integer on the line (e.g. `4 fiber`).
+#[derive(Debug, Clone)]
+struct TokenlistSlot {
+    position: Option<usize>,
+    alts:     Slot,
+}
+
 /// A word wrapped in literal double quotes (`"..."`, length >= 2) marks it
 /// pinned. Shared by tokenlist parsing and word-mode CLI args.
 fn is_pinned_token(s: &str) -> bool {
@@ -141,6 +167,21 @@ fn is_pinned_token(s: &str) -> bool {
 
 fn strip_pin(s: &str) -> &str {
     if is_pinned_token(s) { &s[1..s.len() - 1] } else { s }
+}
+
+/// Splits slot indices into (fixed, free) by whether they carry an
+/// explicit position. When --keep-token-order is set, line order already
+/// fixes every slot's position, so all slots are treated as "free" here
+/// (in file order) rather than double-handled as fixed.
+fn split_fixed_free(slots: &[TokenlistSlot], keep_token_order: bool) -> (Vec<usize>, Vec<usize>) {
+    if keep_token_order {
+        return (Vec::new(), (0..slots.len()).collect());
+    }
+    let fixed: Vec<usize> = slots.iter().enumerate()
+        .filter(|(_, s)| s.position.is_some()).map(|(i, _)| i).collect();
+    let free: Vec<usize> = slots.iter().enumerate()
+        .filter(|(_, s)| s.position.is_none()).map(|(i, _)| i).collect();
+    (fixed, free)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +347,7 @@ fn main() -> Result<()> {
         // ── tokenlist mode ──────────────────────────────────────────────────
         let path  = args.tokenlist.as_ref().unwrap();
         let slots = parse_tokenlist(path)?;
-        validate_slots(&slots, language)?;
+        validate_slots(&slots, language, args.keep_token_order)?;
 
         if force_cpu {
             if !custom_path { println!("--cpu: using CPU (tokenlist mode)."); }
@@ -351,17 +392,35 @@ fn main() -> Result<()> {
 // TOKENLIST PARSING
 // ===========================================================================
 
-fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
+fn parse_tokenlist(path: &PathBuf) -> Result<Vec<TokenlistSlot>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Cannot read tokenlist: {}", path.display()))?;
 
-    let mut slots: Vec<Slot> = Vec::new();
+    let mut slots: Vec<TokenlistSlot> = Vec::new();
     for (lineno, raw) in content.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
 
-        let alternatives: Vec<Alternative> = line
-            .split_whitespace()
+        // A leading bare integer fixes this slot's absolute position
+        // (1-indexed) in the final phrase, e.g. "4 fiber". Consume it
+        // before splitting the rest into alternatives as usual.
+        let mut parts = line.split_whitespace().peekable();
+        let mut position: Option<usize> = None;
+        if let Some(&first) = parts.peek() {
+            if let Ok(n) = first.parse::<usize>() {
+                position = Some(n);
+                parts.next();
+            }
+        }
+        let rest: Vec<&str> = parts.collect();
+        anyhow::ensure!(
+            !rest.is_empty(),
+            "Line {}: has a position number but no word/alternative after it",
+            lineno + 1
+        );
+
+        let alternatives: Vec<Alternative> = rest
+            .into_iter()
             .map(|alt_str| {
                 alt_str.split(',')
                     .filter(|t| !t.is_empty())
@@ -384,18 +443,28 @@ fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
             eprintln!("Warning: line {} empty after parsing, skipping.", lineno + 1);
             continue;
         }
-        slots.push(alternatives);
+        slots.push(TokenlistSlot { position, alts: alternatives });
     }
 
     anyhow::ensure!(!slots.is_empty(), "Tokenlist is empty or has no valid lines");
-    println!("Loaded {} slot(s) from tokenlist.", slots.len());
+    let positioned = slots.iter().filter(|s| s.position.is_some()).count();
+    if positioned > 0 {
+        println!(
+            "Loaded {} slot(s) from tokenlist ({} with a fixed position).",
+            slots.len(), positioned
+        );
+    } else {
+        println!("Loaded {} slot(s) from tokenlist.", slots.len());
+    }
     Ok(slots)
 }
 
-fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
+fn validate_slots(slots: &[TokenlistSlot], language: Language, keep_token_order: bool) -> Result<()> {
     let wl: &'static [&'static str] = language.words_by_prefix("");
+    let mut seen_positions: HashSet<usize> = HashSet::new();
+
     for (si, slot) in slots.iter().enumerate() {
-        for (ai, alt) in slot.iter().enumerate() {
+        for (ai, alt) in slot.alts.iter().enumerate() {
             for tok in alt {
                 if let Token::Word(w) | Token::PinnedWord(w) = tok {
                     anyhow::ensure!(
@@ -403,6 +472,33 @@ fn validate_slots(slots: &[Slot], language: Language) -> Result<()> {
                         "Slot {}, alt {}: '{}' not in BIP-39 wordlist", si+1, ai+1, w
                     );
                 }
+            }
+        }
+
+        if let Some(pos) = slot.position {
+            anyhow::ensure!(
+                (1..=12).contains(&pos),
+                "Slot {}: fixed position {} out of range (must be 1..=12)", si+1, pos
+            );
+            anyhow::ensure!(
+                seen_positions.insert(pos),
+                "Slot {}: fixed position {} is already used by another slot", si+1, pos
+            );
+            for (ai, alt) in slot.alts.iter().enumerate() {
+                anyhow::ensure!(
+                    alt.len() == 1,
+                    "Slot {} (fixed position {}), alt {}: must be exactly one word/'?' \
+                     — a slot with a fixed position occupies a single spot in the phrase",
+                    si+1, pos, ai+1
+                );
+            }
+            if keep_token_order {
+                anyhow::ensure!(
+                    pos == si + 1,
+                    "Slot {}: fixed position {} conflicts with --keep-token-order, \
+                     which already fixes this slot at position {} (its line order)",
+                    si+1, pos, si+1
+                );
             }
         }
     }
@@ -484,9 +580,24 @@ fn missing_combos(n: u16, k: usize) -> Vec<Vec<u16>> {
 // ---------------------------------------------------------------------------
 
 struct LazyPhraseIter {
-    /// [slot][alt][cand_idx] = partial Vec<u16>
-    slot_alts:   Vec<Vec<Vec<Vec<u16>>>>,
+    /// [slot][alt][cand_idx] = partial Vec<u16>. Fixed-position slots occupy
+    /// indices `0..fixed_count`; the remaining slots (free — no fixed
+    /// position) occupy `fixed_count..`.
+    slot_alts:  Vec<Vec<Vec<Vec<u16>>>>,
+    fixed_count: usize,
+    /// 0-indexed absolute phrase position for each fixed slot, same order
+    /// as `slot_alts[0..fixed_count]`.
+    fixed_positions: Vec<usize>,
+    /// Sorted 0-indexed phrase positions not claimed by any fixed slot;
+    /// free slots fill these, in order, as picked by `slot_orders`.
+    remaining_positions: Vec<usize>,
+    /// Permutations of free-slot indices (0-indexed within the free group).
     slot_orders: Vec<Vec<usize>>,
+    /// Precomputed per-order advance chains: `(0..fixed_count)` followed by
+    /// `fixed_count + slot_orders[k][..]`, one entry per `slot_orders[k]`.
+    /// Computed once in `new()` so `advance()`/`next()` never need to
+    /// clone/rebuild this on the hot per-candidate path.
+    chains:      Vec<Vec<usize>>,
     order_pos:   usize,
     alt_idx:     Vec<usize>,
     cand_idx:    Vec<usize>,
@@ -495,57 +606,101 @@ struct LazyPhraseIter {
 }
 
 impl LazyPhraseIter {
+    /// `fixed` slots each carry an explicit absolute position (validated to
+    /// be a single word/'?' per alternative) and are never reordered.
+    /// `free` slots have no fixed position and permute across whatever
+    /// positions `fixed` doesn't claim, unless `keep_token_order` is set.
     fn new(
-        chosen: &[&Slot],
+        fixed: &[&TokenlistSlot],
+        free:  &[&TokenlistSlot],
         keep_token_order: bool,
         keep_word_order:  bool,
         wordlist: &'static [&'static str],
     ) -> Self {
-        let n      = chosen.len();
-        let wl_len = wordlist.len();
+        let wl_len      = wordlist.len();
+        let fixed_count = fixed.len();
+        let free_count  = free.len();
 
-        let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen.iter().map(|slot| {
+        let chosen_alts: Vec<&Slot> = fixed.iter().map(|s| &s.alts)
+            .chain(free.iter().map(|s| &s.alts))
+            .collect();
+
+        let slot_alts: Vec<Vec<Vec<Vec<u16>>>> = chosen_alts.iter().map(|slot| {
             slot.iter().map(|alt| {
                 let (movable, pinned, miss) = expand_alternative(alt, wordlist);
                 slot_candidates(&movable, &pinned, &miss, alt.len(), keep_word_order, wl_len)
             }).collect()
         }).collect();
 
-        let slot_orders: Vec<Vec<usize>> = if keep_token_order || n <= 1 {
-            vec![(0..n).collect()]
+        let fixed_positions: Vec<usize> = fixed.iter()
+            .map(|s| s.position.expect("fixed slot must have a position") - 1)
+            .collect();
+        let mut used = [false; 12];
+        for &p in &fixed_positions { used[p] = true; }
+        let remaining_positions: Vec<usize> = (0..12).filter(|&i| !used[i]).collect();
+
+        let slot_orders: Vec<Vec<usize>> = if keep_token_order || free_count <= 1 {
+            vec![(0..free_count).collect()]
         } else {
-            (0..n).permutations(n).collect()
+            (0..free_count).permutations(free_count).collect()
         };
 
-        let num = slot_alts.len();
+        // Precompute the advance-chain for each order once, up front —
+        // this used to be rebuilt (with a heap allocation) on every single
+        // `next()` call, which throttled candidate throughput badly.
+        let chains: Vec<Vec<usize>> = slot_orders.iter().map(|order| {
+            let mut c: Vec<usize> = (0..fixed_count).collect();
+            c.extend(order.iter().map(|&fsi| fixed_count + fsi));
+            c
+        }).collect();
+
+        let total = fixed_count + free_count;
         LazyPhraseIter {
             slot_alts,
+            fixed_count,
+            fixed_positions,
+            remaining_positions,
             slot_orders,
+            chains,
             order_pos: 0,
-            alt_idx:   vec![0; num],
-            cand_idx:  vec![0; num],
+            alt_idx:   vec![0; total],
+            cand_idx:  vec![0; total],
             first: true,
-            done:  num == 0,
+            done:  total == 0,
         }
     }
 
-    fn build(&self, order: &[usize]) -> Option<[u16; 12]> {
+    fn build(&self) -> Option<[u16; 12]> {
         let mut phrase = [0u16; 12];
+
+        for fi in 0..self.fixed_count {
+            let words = &self.slot_alts[fi][self.alt_idx[fi]][self.cand_idx[fi]];
+            if words.len() != 1 { return None; }
+            phrase[self.fixed_positions[fi]] = words[0];
+        }
+
+        let order = &self.slot_orders[self.order_pos];
         let mut off = 0usize;
-        for &si in order {
+        for &fsi in order {
+            let si = self.fixed_count + fsi;
             let words = &self.slot_alts[si][self.alt_idx[si]][self.cand_idx[si]];
-            if off + words.len() > 12 { return None; }
-            phrase[off..off+words.len()].copy_from_slice(words);
+            if off + words.len() > self.remaining_positions.len() { return None; }
+            for (k, &w) in words.iter().enumerate() {
+                phrase[self.remaining_positions[off + k]] = w;
+            }
             off += words.len();
         }
-        if off == 12 { Some(phrase) } else { None }
+        if off == self.remaining_positions.len() { Some(phrase) } else { None }
     }
 
-    fn advance(&mut self, order: &[usize]) -> bool {
-        let n = order.len();
+    /// Advances candidate/alt indices along the chain for the current
+    /// `order_pos`. Reads `self.chains[self.order_pos]` (precomputed in
+    /// `new()`) index-by-index — no allocation on this hot path.
+    fn advance(&mut self) -> bool {
+        let n = self.chains[self.order_pos].len();
         let mut pos = n as isize - 1;
         while pos >= 0 {
-            let si = order[pos as usize];
+            let si = self.chains[self.order_pos][pos as usize];
             self.cand_idx[si] += 1;
             if self.cand_idx[si] < self.slot_alts[si][self.alt_idx[si]].len() { return true; }
             self.cand_idx[si] = 0;
@@ -565,15 +720,14 @@ impl Iterator for LazyPhraseIter {
         if self.done { return None; }
         loop {
             if self.order_pos >= self.slot_orders.len() { self.done = true; return None; }
-            let order = self.slot_orders[self.order_pos].clone();
 
             if self.first {
                 self.first = false;
-                if let Some(p) = self.build(&order) { return Some(p); }
+                if let Some(p) = self.build() { return Some(p); }
             }
 
-            if self.advance(&order) {
-                if let Some(p) = self.build(&order) { return Some(p); }
+            if self.advance() {
+                if let Some(p) = self.build() { return Some(p); }
                 continue;
             }
 
@@ -753,7 +907,7 @@ fn probe_batch_size(
 
 fn run_tokenlist_gpu(
     args:     &Args,
-    slots:    &[Slot],
+    slots:    &[TokenlistSlot],
     target:   &Target,
     language: Language,
     coin:     Coin,
@@ -768,22 +922,33 @@ fn run_tokenlist_gpu(
     let batch_size = args.batch_size.unwrap_or_else(||
         probe_batch_size(&gpu_handle, &gpu_wl, &[0u8;20], args.min_batch, args.max_batch, pipeline));
 
+    let (fixed_all, free_all) = split_fixed_free(slots, args.keep_token_order);
+    let fixed_count = fixed_all.len();
+
     let min_tok = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_tok = slots.len();
+    let min_free = min_tok.saturating_sub(fixed_count);
+    let max_free = max_tok.saturating_sub(fixed_count).min(free_all.len());
+
     println!("Using GPU (CUDA) — tokenlist mode — batch {}", format_number(batch_size));
     println!("Slot subsets: {min_tok}..={max_tok}");
+    if fixed_count > 0 {
+        println!("Fixed-position slots: {fixed_count} (always included, never reordered)");
+    }
 
     let wall = Instant::now();
 
-    for slot_count in min_tok..=max_tok {
-        for chosen_idx in (0..slots.len()).combinations(slot_count) {
-            let chosen: Vec<&Slot> = chosen_idx.iter().map(|&i| &slots[i]).collect();
+    for free_count in min_free..=max_free {
+        for free_chosen in free_all.iter().copied().combinations(free_count) {
+            let fixed_slots: Vec<&TokenlistSlot> = fixed_all.iter().map(|&i| &slots[i]).collect();
+            let free_slots:  Vec<&TokenlistSlot> = free_chosen.iter().map(|&i| &slots[i]).collect();
+            let chosen_idx: Vec<usize> = fixed_all.iter().copied().chain(free_chosen.iter().copied()).collect();
 
             println!("\nSlot combination {:?}", chosen_idx);
             let _ = io::stdout().flush();
 
             let iter = ProgressIter::new(
-                LazyPhraseIter::new(&chosen, args.keep_token_order, args.keep_word_order, wordlist),
+                LazyPhraseIter::new(&fixed_slots, &free_slots, args.keep_token_order, args.keep_word_order, wordlist),
                 None, // total unknown without double-iteration
                 100_000,
             );
@@ -823,7 +988,7 @@ fn run_tokenlist_gpu(
 
 fn run_tokenlist_cpu(
     args:     &Args,
-    slots:    &[Slot],
+    slots:    &[TokenlistSlot],
     target:   &Target,
     language: Language,
     coin:     Coin,
@@ -837,10 +1002,19 @@ fn run_tokenlist_cpu(
     let target_disp = target.as_display_string();
     let secp = Arc::new(Secp256k1::new());
 
+    let (fixed_all, free_all) = split_fixed_free(slots, args.keep_token_order);
+    let fixed_count = fixed_all.len();
+
     let min_tok = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_tok = slots.len();
+    let min_free = min_tok.saturating_sub(fixed_count);
+    let max_free = max_tok.saturating_sub(fixed_count).min(free_all.len());
+
     println!("Using CPU ({num_threads} threads) — tokenlist mode");
     println!("Slot subsets: {min_tok}..={max_tok}");
+    if fixed_count > 0 {
+        println!("Fixed-position slots: {fixed_count} (always included, never reordered)");
+    }
 
     let counter      = Arc::new(AtomicUsize::new(0));
     let found        = Arc::new(AtomicBool::new(false));
@@ -848,17 +1022,19 @@ fn run_tokenlist_cpu(
     let found_index  = Arc::new(AtomicUsize::new(0));
     let start        = Instant::now();
 
-    'outer: for slot_count in min_tok..=max_tok {
+    'outer: for free_count in min_free..=max_free {
         if found.load(Ordering::Relaxed) { break; }
 
-        for chosen_idx in (0..slots.len()).combinations(slot_count) {
+        for free_chosen in free_all.iter().copied().combinations(free_count) {
             if found.load(Ordering::Relaxed) { break 'outer; }
 
-            let chosen: Vec<&Slot> = chosen_idx.iter().map(|&i| &slots[i]).collect();
+            let fixed_slots: Vec<&TokenlistSlot> = fixed_all.iter().map(|&i| &slots[i]).collect();
+            let free_slots:  Vec<&TokenlistSlot> = free_chosen.iter().map(|&i| &slots[i]).collect();
+            let chosen_idx: Vec<usize> = fixed_all.iter().copied().chain(free_chosen.iter().copied()).collect();
             println!("\nSlot combination {:?}", chosen_idx);
 
             let iter = LazyPhraseIter::new(
-                &chosen, args.keep_token_order, args.keep_word_order, wordlist,
+                &fixed_slots, &free_slots, args.keep_token_order, args.keep_word_order, wordlist,
             );
             let interval = 100_000usize;
 
